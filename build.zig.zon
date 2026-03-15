@@ -1,0 +1,12 @@
+.{
+    .name = .minillm,
+    .version = "0.1.0",
+    .fingerprint = 0x835cd666ab978ad0,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "bin",
+    },
+}
