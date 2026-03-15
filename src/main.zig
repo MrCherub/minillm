@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const Command = enum { chat, ask, models, help };
+const Mode = enum { normal, careful, verify, selfcheck };
 
 const Nord = struct {
     const title = "38;2;163;190;140";
@@ -22,6 +23,7 @@ const Parsed = struct {
     command: Command = .chat,
     prompt: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    mode: Mode = .normal,
 };
 
 fn useColor() bool {
@@ -72,6 +74,23 @@ fn parseArgs(allocator: Allocator) !Parsed {
             idx += 1;
             if (idx >= args.len) return error.MissingModel;
             parsed.model = try allocator.dupe(u8, args[idx]);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--mode")) {
+            idx += 1;
+            if (idx >= args.len) return error.MissingMode;
+            const mode = args[idx];
+            if (std.mem.eql(u8, mode, "normal")) {
+                parsed.mode = .normal;
+            } else if (std.mem.eql(u8, mode, "careful")) {
+                parsed.mode = .careful;
+            } else if (std.mem.eql(u8, mode, "verify")) {
+                parsed.mode = .verify;
+            } else if (std.mem.eql(u8, mode, "selfcheck")) {
+                parsed.mode = .selfcheck;
+            } else {
+                return error.InvalidMode;
+            }
             continue;
         }
 
@@ -226,6 +245,156 @@ fn runOllama(allocator: Allocator, config: Config, argv_tail: []const []const u8
     };
 }
 
+fn carefulSystemPrompt() []const u8 {
+    return
+        "You are a cautious assistant. Do not guess. " ++
+        "If the question depends on local system state, training history, installed models, or files, and no trusted context is provided, answer exactly: I don't know. " ++
+        "Do not invent frameworks, datasets, or machine details. " ++
+        "Respond using this format:\n" ++
+        "Answer: <answer or I don't know>\n" ++
+        "Evidence basis: <brief basis or 'No trusted local evidence'>\n" ++
+        "Confidence: high|medium|low";
+}
+
+fn draftSystemPrompt() []const u8 {
+    return
+        "Draft a short answer. Avoid unsupported claims. " ++
+        "If the question appears to depend on local system state or inaccessible facts, say I don't know.";
+}
+
+fn verificationPlannerSystemPrompt() []const u8 {
+    return
+        "You plan factual verification questions. Return strict JSON only. " ++
+        "Use this schema: {\"questions\":[\"...\",\"...\"]}. " ++
+        "Prefer 3 to 5 short verification questions that directly test the draft's factual claims.";
+}
+
+fn verificationAnswerSystemPrompt() []const u8 {
+    return
+        "Answer the verification question independently and conservatively. " ++
+        "Do not reuse unsupported claims from any earlier draft. " ++
+        "If the answer is unknown, say Unknown.";
+}
+
+fn verificationFinalSystemPrompt() []const u8 {
+    return
+        "You are revising an answer after verification. " ++
+        "Use only supported claims from the verification answers. " ++
+        "If too much remains uncertain, answer exactly: I don't know. " ++
+        "Respond using this format:\n" ++
+        "Answer: <answer or I don't know>\n" ++
+        "Evidence basis: <which verification answers support it>\n" ++
+        "Confidence: high|medium|low";
+}
+
+fn selfcheckJudgeSystemPrompt() []const u8 {
+    return
+        "You are comparing multiple independently sampled answers for factual consistency. " ++
+        "Use only facts shared across at least two answers. " ++
+        "If the answers materially disagree or appear speculative, answer I don't know. " ++
+        "Respond using this format:\n" ++
+        "Answer: <answer or I don't know>\n" ++
+        "Evidence basis: <facts shared across samples or 'No stable shared facts'>\n" ++
+        "Confidence: high|medium|low";
+}
+
+fn runPrompt(allocator: Allocator, config: Config, model: []const u8, prompt: []const u8) ![]u8 {
+    return runOllama(allocator, config, &.{ "run", model, prompt });
+}
+
+fn askNormal(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8) ![]u8 {
+    return runPrompt(allocator, config, model, prompt);
+}
+
+fn askCareful(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8) ![]u8 {
+    const full_prompt = try std.fmt.allocPrint(allocator, "{s}\n\nUser question:\n{s}", .{ carefulSystemPrompt(), prompt });
+    defer allocator.free(full_prompt);
+    return runPrompt(allocator, config, model, full_prompt);
+}
+
+fn askVerify(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8) ![]u8 {
+    const draft_prompt = try std.fmt.allocPrint(allocator, "{s}\n\nUser question:\n{s}", .{ draftSystemPrompt(), prompt });
+    defer allocator.free(draft_prompt);
+
+    const draft = try runPrompt(allocator, config, model, draft_prompt);
+    defer allocator.free(draft);
+
+    const planner_prompt = try std.fmt.allocPrint(
+        allocator,
+        "{s}\n\nUser question:\n{s}\n\nDraft answer:\n{s}\n\nReturn exactly 3 short verification questions, one per line, with no numbering or commentary.",
+        .{ verificationPlannerSystemPrompt(), prompt, draft },
+    );
+    defer allocator.free(planner_prompt);
+
+    const planner_output = try runPrompt(allocator, config, model, planner_prompt);
+    defer allocator.free(planner_output);
+
+    var verification_report: std.ArrayList(u8) = .empty;
+    defer verification_report.deinit(allocator);
+
+    var line_iter = std.mem.splitScalar(u8, planner_output, '\n');
+    var idx: usize = 0;
+    while (line_iter.next()) |raw_line| {
+        const question = std.mem.trim(u8, raw_line, " \t\r\n-*0123456789.");
+        if (question.len == 0) continue;
+        if (idx >= 3) break;
+
+        const answer_prompt = try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\nOriginal user question:\n{s}\n\nVerification question:\n{s}",
+            .{ verificationAnswerSystemPrompt(), prompt, question },
+        );
+        defer allocator.free(answer_prompt);
+
+        const answer = try runPrompt(allocator, config, model, answer_prompt);
+        defer allocator.free(answer);
+
+        try verification_report.writer(allocator).print("Q{d}: {s}\nA{d}: {s}\n\n", .{ idx + 1, question, idx + 1, answer });
+        idx += 1;
+    }
+
+    const final_prompt = try std.fmt.allocPrint(
+        allocator,
+        "{s}\n\nOriginal user question:\n{s}\n\nInitial draft:\n{s}\n\nVerification results:\n{s}",
+        .{ verificationFinalSystemPrompt(), prompt, draft, verification_report.items },
+    );
+    defer allocator.free(final_prompt);
+
+    return runPrompt(allocator, config, model, final_prompt);
+}
+
+fn askSelfCheck(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8) ![]u8 {
+    var candidates: [3][]u8 = undefined;
+    defer {
+        for (candidates) |candidate| allocator.free(candidate);
+    }
+
+    const sampling_labels = [_][]const u8{
+        "Independent answer attempt A.",
+        "Independent answer attempt B.",
+        "Independent answer attempt C.",
+    };
+
+    for (sampling_labels, 0..) |label, idx| {
+        const sample_prompt = try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n{s}\n\nUser question:\n{s}",
+            .{ carefulSystemPrompt(), label, prompt },
+        );
+        defer allocator.free(sample_prompt);
+        candidates[idx] = try runPrompt(allocator, config, model, sample_prompt);
+    }
+
+    const judge_prompt = try std.fmt.allocPrint(
+        allocator,
+        "{s}\n\nUser question:\n{s}\n\nCandidate answer 1:\n{s}\n\nCandidate answer 2:\n{s}\n\nCandidate answer 3:\n{s}",
+        .{ selfcheckJudgeSystemPrompt(), prompt, candidates[0], candidates[1], candidates[2] },
+    );
+    defer allocator.free(judge_prompt);
+
+    return runPrompt(allocator, config, model, judge_prompt);
+}
+
 fn listModels(allocator: Allocator, config: Config, writer: *std.Io.Writer, colors: bool) !u8 {
     const output = try runOllama(allocator, config, &.{ "list" });
     defer allocator.free(output);
@@ -235,13 +404,28 @@ fn listModels(allocator: Allocator, config: Config, writer: *std.Io.Writer, colo
     return 0;
 }
 
-fn askOnce(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8, writer: *std.Io.Writer, colors: bool) !u8 {
-    const output = try runOllama(allocator, config, &.{ "run", model, prompt });
+fn askOnce(
+    allocator: Allocator,
+    config: Config,
+    prompt: []const u8,
+    model: []const u8,
+    mode: Mode,
+    writer: *std.Io.Writer,
+    colors: bool,
+) !u8 {
+    const output = switch (mode) {
+        .normal => try askNormal(allocator, config, prompt, model),
+        .careful => try askCareful(allocator, config, prompt, model),
+        .verify => try askVerify(allocator, config, prompt, model),
+        .selfcheck => try askSelfCheck(allocator, config, prompt, model),
+    };
     defer allocator.free(output);
 
     try paint(writer, colors, Nord.accent, "model: ");
     try paint(writer, colors, Nord.muted, model);
     try writer.writeByte('\n');
+    try paint(writer, colors, Nord.accent, "mode: ");
+    try printlnColor(writer, colors, Nord.muted, @tagName(mode));
     try printlnColor(writer, colors, Nord.text, output);
     return 0;
 }
@@ -253,6 +437,9 @@ fn printHelp(writer: *std.Io.Writer) !void {
         "  minillm\n" ++
         "  minillm ask \"your prompt\"\n" ++
         "  minillm models\n" ++
+        "  minillm --mode careful ask \"your prompt\"\n" ++
+        "  minillm --mode verify ask \"your prompt\"\n" ++
+        "  minillm --mode selfcheck ask \"your prompt\"\n" ++
         "  minillm --model jj-code ask \"fix this shell command\"\n\n" ++
         "Env:\n" ++
         "  MINILLM_MODEL         default model (default: jj-general)\n" ++
@@ -261,15 +448,18 @@ fn printHelp(writer: *std.Io.Writer) !void {
     );
 }
 
-fn runChat(allocator: Allocator, config: Config, selected_model: []const u8) !u8 {
+fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, initial_mode: Mode) !u8 {
     const colors = useColor();
     var out = std.fs.File.stdout().writer(&.{});
     var err = std.fs.File.stderr().writer(&.{});
+    var mode = initial_mode;
 
     try printlnColor(&out.interface, colors, Nord.title, "minillm");
     try paint(&out.interface, colors, Nord.muted, "model: ");
     try printlnColor(&out.interface, colors, Nord.accent, selected_model);
-    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models to list models.");
+    try paint(&out.interface, colors, Nord.muted, "mode: ");
+    try printlnColor(&out.interface, colors, Nord.accent, @tagName(mode));
+    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models to list models, :mode normal|careful|verify|selfcheck.");
 
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
@@ -289,9 +479,27 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8) !u8
             try out.interface.writeByte('\n');
             continue;
         }
+        if (std.mem.startsWith(u8, line, ":mode ")) {
+            const mode_name = std.mem.trim(u8, line[6..], " \t");
+            if (std.mem.eql(u8, mode_name, "normal")) {
+                mode = .normal;
+            } else if (std.mem.eql(u8, mode_name, "careful")) {
+                mode = .careful;
+            } else if (std.mem.eql(u8, mode_name, "verify")) {
+                mode = .verify;
+            } else if (std.mem.eql(u8, mode_name, "selfcheck")) {
+                mode = .selfcheck;
+            } else {
+                try printlnColor(&err.interface, colors, Nord.muted, "unknown mode");
+                continue;
+            }
+            try paint(&out.interface, colors, Nord.muted, "mode: ");
+            try printlnColor(&out.interface, colors, Nord.accent, @tagName(mode));
+            continue;
+        }
 
         try printlnColor(&out.interface, colors, Nord.muted, "thinking...");
-        _ = askOnce(allocator, config, line, selected_model, &out.interface, colors) catch |e| {
+        _ = askOnce(allocator, config, line, selected_model, mode, &out.interface, colors) catch |e| {
             const msg = try std.fmt.allocPrint(allocator, "request failed: {s}", .{@errorName(e)});
             defer allocator.free(msg);
             try printlnColor(&err.interface, colors, Nord.muted, msg);
@@ -333,8 +541,8 @@ pub fn main() !void {
         },
         .ask => {
             var out = std.fs.File.stdout().writer(&.{});
-            std.process.exit(try askOnce(allocator, config, parsed.prompt.?, selected_model, &out.interface, colors));
+            std.process.exit(try askOnce(allocator, config, parsed.prompt.?, selected_model, parsed.mode, &out.interface, colors));
         },
-        .chat => std.process.exit(try runChat(allocator, config, selected_model)),
+        .chat => std.process.exit(try runChat(allocator, config, selected_model, parsed.mode)),
     }
 }

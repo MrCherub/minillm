@@ -6,6 +6,7 @@ It keeps the first version simple:
 - `minillm` opens interactive chat
 - `minillm ask "..."` sends a one-shot prompt
 - `minillm models` lists available models
+- `minillm --mode careful|verify|selfcheck ...` adds anti-hallucination behaviors
 - uses local `ollama` if installed
 - otherwise falls back to your Mac mini over SSH
 
@@ -30,8 +31,36 @@ So the split is:
 minillm
 minillm ask "Explain tangent spaces simply."
 minillm models
+minillm --mode careful ask "What corpora has this model been trained on?"
+minillm --mode verify ask "What corpora has this model been trained on?"
+minillm --mode selfcheck ask "What corpora has this model been trained on?"
 minillm --model jj-code ask "Write a zsh one-liner to list PDFs."
 ```
+
+Interactive mode also supports:
+
+- `:q`
+- `:models`
+- `:mode normal`
+- `:mode careful`
+- `:mode verify`
+- `:mode selfcheck`
+
+## Anti-Hallucination Modes
+
+- `normal`
+  - plain answer generation
+- `careful`
+  - abstention-first prompting
+  - if the answer depends on local state with no trusted evidence, it should say `I don't know`
+- `verify`
+  - draft -> verification questions -> independent checks -> final revision
+  - based on the verification-pass style used in Chain-of-Verification work
+- `selfcheck`
+  - generates multiple independent answer attempts and then keeps only stable shared facts
+  - if the samples disagree, it should abstain
+
+These modes reduce hallucinations probabilistically. They do not replace grounding or direct tool access for machine-specific facts.
 
 ## Defaults
 
@@ -53,3 +82,4 @@ export MINILLM_REMOTE_OLLAMA=/Applications/Ollama.app/Contents/Resources/ollama
 - The default remote model is `jj-general`.
 - Set `MINILLM_REMOTE_HOST` locally to your actual Mac mini host.
 - The SSH fallback path shell-quotes prompts correctly, so apostrophes in questions work.
+- For local machine-state questions, the best long-term fix is still explicit commands or grounded local context, not prompt-only control.
