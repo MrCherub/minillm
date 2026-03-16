@@ -13,6 +13,14 @@ const Nord = struct {
     const reset = "0";
 };
 
+const startup_banner =
+    " ███╗   ███╗ ██╗ ███╗   ██╗ ██╗ ██╗      ██╗      ███╗   ███╗\n" ++
+    " ████╗ ████║ ██║ ████╗  ██║ ██║ ██║      ██║      ████╗ ████║\n" ++
+    " ██╔████╔██║ ██║ ██╔██╗ ██║ ██║ ██║      ██║      ██╔████╔██║\n" ++
+    " ██║╚██╔╝██║ ██║ ██║╚██╗██║ ██║ ██║      ██║      ██║╚██╔╝██║\n" ++
+    " ██║ ╚═╝ ██║ ██║ ██║ ╚████║ ██║ ███████╗ ███████╗ ██║ ╚═╝ ██║\n" ++
+    " ╚═╝     ╚═╝ ╚═╝ ╚═╝  ╚═══╝ ╚═╝ ╚══════╝ ╚══════╝ ╚═╝     ╚═╝\n";
+
 const Config = struct {
     remote_host: []const u8,
     remote_ollama: []const u8,
@@ -477,7 +485,7 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
     var err = std.fs.File.stderr().writer(&.{});
     var mode = initial_mode;
 
-    try printlnColor(&out.interface, colors, Nord.title, "minillm");
+    try printlnColor(&out.interface, colors, Nord.title, startup_banner);
     try paint(&out.interface, colors, Nord.muted, "model: ");
     try printlnColor(&out.interface, colors, Nord.accent, selected_model);
     try paint(&out.interface, colors, Nord.muted, "mode: ");
