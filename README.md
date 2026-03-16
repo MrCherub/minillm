@@ -6,6 +6,7 @@ It keeps the first version simple:
 - `minillm` opens interactive chat
 - `minillm ask "..."` sends a one-shot prompt
 - `minillm models` lists available models
+- `minillm modes` lists available modes
 - `minillm --mode careful|verify|selfcheck ...` adds anti-hallucination behaviors
 - uses local `ollama` if installed
 - otherwise falls back to your Mac mini over SSH
@@ -31,6 +32,7 @@ So the split is:
 minillm
 minillm ask "Explain tangent spaces simply."
 minillm models
+minillm modes
 minillm --mode careful ask "What corpora has this model been trained on?"
 minillm --mode verify ask "What corpora has this model been trained on?"
 minillm --mode selfcheck ask "What corpora has this model been trained on?"
@@ -41,6 +43,7 @@ Interactive mode also supports:
 
 - `:q`
 - `:models`
+- `:modes`
 - `:mode normal`
 - `:mode careful`
 - `:mode verify`

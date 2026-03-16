@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const Command = enum { chat, ask, models, help };
+const Command = enum { chat, ask, models, modes, help };
 const Mode = enum { normal, careful, verify, selfcheck };
 
 const Nord = struct {
@@ -64,6 +64,10 @@ fn parseArgs(allocator: Allocator) !Parsed {
         }
         if (std.mem.eql(u8, arg, "models")) {
             parsed.command = .models;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "modes")) {
+            parsed.command = .modes;
             continue;
         }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help")) {
@@ -404,6 +408,19 @@ fn listModels(allocator: Allocator, config: Config, writer: *std.Io.Writer, colo
     return 0;
 }
 
+fn listModes(writer: *std.Io.Writer, colors: bool) !u8 {
+    try printlnColor(writer, colors, Nord.title, "Available modes");
+    try printlnColor(writer, colors, Nord.accent, "normal");
+    try printlnColor(writer, colors, Nord.text, "  Plain answer generation.");
+    try printlnColor(writer, colors, Nord.accent, "careful");
+    try printlnColor(writer, colors, Nord.text, "  Abstention-first prompting for lower-confidence answers.");
+    try printlnColor(writer, colors, Nord.accent, "verify");
+    try printlnColor(writer, colors, Nord.text, "  Draft, verify claims independently, then revise.");
+    try printlnColor(writer, colors, Nord.accent, "selfcheck");
+    try printlnColor(writer, colors, Nord.text, "  Compare multiple answers and keep only stable shared facts.");
+    return 0;
+}
+
 fn askOnce(
     allocator: Allocator,
     config: Config,
@@ -437,6 +454,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
         "  minillm\n" ++
         "  minillm ask \"your prompt\"\n" ++
         "  minillm models\n" ++
+        "  minillm modes\n" ++
         "  minillm --mode careful ask \"your prompt\"\n" ++
         "  minillm --mode verify ask \"your prompt\"\n" ++
         "  minillm --mode selfcheck ask \"your prompt\"\n" ++
@@ -444,7 +462,12 @@ fn printHelp(writer: *std.Io.Writer) !void {
         "Env:\n" ++
         "  MINILLM_MODEL         default model (default: jj-general)\n" ++
         "  MINILLM_REMOTE_HOST   ssh host fallback (default: user@example-host)\n" ++
-        "  MINILLM_REMOTE_OLLAMA remote ollama binary path\n",
+        "  MINILLM_REMOTE_OLLAMA remote ollama binary path\n\n" ++
+        "Modes:\n" ++
+        "  normal     Plain answer generation\n" ++
+        "  careful    Abstention-first prompting\n" ++
+        "  verify     Draft, verify, then revise\n" ++
+        "  selfcheck  Compare multiple answers for agreement\n",
     );
 }
 
@@ -459,7 +482,7 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
     try printlnColor(&out.interface, colors, Nord.accent, selected_model);
     try paint(&out.interface, colors, Nord.muted, "mode: ");
     try printlnColor(&out.interface, colors, Nord.accent, @tagName(mode));
-    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models to list models, :mode normal|careful|verify|selfcheck.");
+    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models to list models, :modes to list modes, :mode normal|careful|verify|selfcheck.");
 
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
@@ -538,6 +561,10 @@ pub fn main() !void {
         .models => {
             var out = std.fs.File.stdout().writer(&.{});
             std.process.exit(try listModels(allocator, config, &out.interface, colors));
+        },
+        .modes => {
+            var out = std.fs.File.stdout().writer(&.{});
+            std.process.exit(try listModes(&out.interface, colors));
         },
         .ask => {
             var out = std.fs.File.stdout().writer(&.{});
