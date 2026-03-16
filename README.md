@@ -42,12 +42,12 @@ minillm --model jj-code ask "Write a zsh one-liner to list PDFs."
 Interactive mode also supports:
 
 - `:q`
-- `:models`
-- `:modes`
-- `:mode normal`
-- `:mode careful`
-- `:mode verify`
-- `:mode selfcheck`
+- `:models` or `models`
+- `:modes` or `modes`
+- `:mode normal` or `mode normal`
+- `:mode careful` or `mode careful`
+- `:mode verify` or `mode verify`
+- `:mode selfcheck` or `mode selfcheck`
 
 ## Anti-Hallucination Modes
 
