@@ -1,5 +1,7 @@
 # minillm
 
+![minillm banner](./assets/minillm-banner.png)
+
 `minillm` is a small Zig CLI for talking to your Ollama models with Nord-inspired ANSI colors.
 
 It keeps the first version simple:
