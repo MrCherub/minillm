@@ -482,7 +482,7 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
     try printlnColor(&out.interface, colors, Nord.accent, selected_model);
     try paint(&out.interface, colors, Nord.muted, "mode: ");
     try printlnColor(&out.interface, colors, Nord.accent, @tagName(mode));
-    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models to list models, :modes to list modes, :mode normal|careful|verify|selfcheck.");
+    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models/models to list models, :modes/modes to list modes, :mode/mode normal|careful|verify|selfcheck.");
 
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
@@ -497,13 +497,19 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
         const line = std.mem.trim(u8, maybe_line.?, " \t\r\n");
         if (line.len == 0) continue;
         if (std.mem.eql(u8, line, ":q") or std.mem.eql(u8, line, "quit") or std.mem.eql(u8, line, "exit")) return 0;
-        if (std.mem.eql(u8, line, ":models")) {
+        if (std.mem.eql(u8, line, ":models") or std.mem.eql(u8, line, "models")) {
             _ = try listModels(allocator, config, &out.interface, colors);
             try out.interface.writeByte('\n');
             continue;
         }
-        if (std.mem.startsWith(u8, line, ":mode ")) {
-            const mode_name = std.mem.trim(u8, line[6..], " \t");
+        if (std.mem.eql(u8, line, ":modes") or std.mem.eql(u8, line, "modes")) {
+            _ = try listModes(&out.interface, colors);
+            try out.interface.writeByte('\n');
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, ":mode ") or std.mem.startsWith(u8, line, "mode ")) {
+            const offset: usize = if (std.mem.startsWith(u8, line, ":mode ")) 6 else 5;
+            const mode_name = std.mem.trim(u8, line[offset..], " \t");
             if (std.mem.eql(u8, mode_name, "normal")) {
                 mode = .normal;
             } else if (std.mem.eql(u8, mode_name, "careful")) {
