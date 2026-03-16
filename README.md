@@ -1,6 +1,6 @@
 # minillm
 
-`minillm` is a small Zig CLI for talking to your Ollama models with a Nord-themed terminal UI.
+`minillm` is a small Zig CLI for talking to your Ollama models with Nord-inspired ANSI colors.
 
 It keeps the first version simple:
 - `minillm` opens interactive chat
