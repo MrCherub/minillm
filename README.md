@@ -50,6 +50,7 @@ Interactive mode also supports:
 - `:mode careful` or `mode careful`
 - `:mode verify` or `mode verify`
 - `:mode selfcheck` or `mode selfcheck`
+- `normal`, `careful`, `verify`, or `selfcheck` by themselves also switch modes
 
 ## Anti-Hallucination Modes
 

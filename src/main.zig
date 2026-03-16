@@ -5,7 +5,7 @@ const Command = enum { chat, ask, models, modes, help };
 const Mode = enum { normal, careful, verify, selfcheck };
 
 const Nord = struct {
-    const title = "38;2;163;190;140";
+    const title = "38;2;147;194;184";
     const accent = "38;2;136;192;208";
     const prompt = "38;2;235;203;139";
     const muted = "38;2;129;161;193";
@@ -490,7 +490,7 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
     try printlnColor(&out.interface, colors, Nord.accent, selected_model);
     try paint(&out.interface, colors, Nord.muted, "mode: ");
     try printlnColor(&out.interface, colors, Nord.accent, @tagName(mode));
-    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models/models to list models, :modes/modes to list modes, :mode/mode normal|careful|verify|selfcheck.");
+    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models/models to list models, :modes/modes to list modes, :mode/mode normal|careful|verify|selfcheck, or just normal/careful/verify/selfcheck.");
 
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
@@ -515,9 +515,13 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
             try out.interface.writeByte('\n');
             continue;
         }
-        if (std.mem.startsWith(u8, line, ":mode ") or std.mem.startsWith(u8, line, "mode ")) {
-            const offset: usize = if (std.mem.startsWith(u8, line, ":mode ")) 6 else 5;
-            const mode_name = std.mem.trim(u8, line[offset..], " \t");
+        if (std.mem.startsWith(u8, line, ":mode ") or std.mem.startsWith(u8, line, "mode ") or std.mem.eql(u8, line, "normal") or std.mem.eql(u8, line, "careful") or std.mem.eql(u8, line, "verify") or std.mem.eql(u8, line, "selfcheck")) {
+            const mode_name = if (std.mem.startsWith(u8, line, ":mode "))
+                std.mem.trim(u8, line[6..], " \t")
+            else if (std.mem.startsWith(u8, line, "mode "))
+                std.mem.trim(u8, line[5..], " \t")
+            else
+                line;
             if (std.mem.eql(u8, mode_name, "normal")) {
                 mode = .normal;
             } else if (std.mem.eql(u8, mode_name, "careful")) {
