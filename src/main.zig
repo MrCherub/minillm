@@ -1,8 +1,10 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const Command = enum { chat, ask, models, modes, help };
+const Command = enum { chat, ask, models, modes, facts, help };
 const Mode = enum { normal, careful, verify, selfcheck };
+const max_history_turns = 6;
+const max_history_chars = 600;
 
 const Nord = struct {
     const title = "38;2;147;194;184";
@@ -25,6 +27,7 @@ const Config = struct {
     remote_host: []const u8,
     remote_ollama: []const u8,
     default_model: []const u8,
+    model_facts_dir: ?[]const u8,
 };
 
 const Parsed = struct {
@@ -32,6 +35,21 @@ const Parsed = struct {
     prompt: ?[]const u8 = null,
     model: ?[]const u8 = null,
     mode: Mode = .normal,
+};
+
+const TurnRole = enum { user, assistant };
+
+const ChatTurn = struct {
+    role: TurnRole,
+    text: []u8,
+};
+
+const PromptContext = struct {
+    model: []const u8,
+    remote_host: []const u8,
+    ollama_lineage: []const u8,
+    model_facts: []const u8,
+    history: []const ChatTurn = &.{},
 };
 
 fn useColor() bool {
@@ -78,6 +96,14 @@ fn parseArgs(allocator: Allocator) !Parsed {
             parsed.command = .modes;
             continue;
         }
+        if (std.mem.eql(u8, arg, "facts")) {
+            parsed.command = .facts;
+            if (idx + 1 < args.len and args[idx + 1][0] != '-') {
+                idx += 1;
+                parsed.model = try allocator.dupe(u8, args[idx]);
+            }
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help")) {
             parsed.command = .help;
             continue;
@@ -120,11 +146,13 @@ fn configFromEnv(allocator: Allocator) !Config {
     const remote_host = std.process.getEnvVarOwned(allocator, "MINILLM_REMOTE_HOST") catch try allocator.dupe(u8, "user@example-host");
     const remote_ollama = std.process.getEnvVarOwned(allocator, "MINILLM_REMOTE_OLLAMA") catch try allocator.dupe(u8, "/Applications/Ollama.app/Contents/Resources/ollama");
     const default_model = std.process.getEnvVarOwned(allocator, "MINILLM_MODEL") catch try allocator.dupe(u8, "jj-general");
+    const model_facts_dir = std.process.getEnvVarOwned(allocator, "MINILLM_MODEL_FACTS_DIR") catch null;
 
     return .{
         .remote_host = remote_host,
         .remote_ollama = remote_ollama,
         .default_model = default_model,
+        .model_facts_dir = model_facts_dir,
     };
 }
 
@@ -132,6 +160,156 @@ fn freeConfig(allocator: Allocator, config: Config) void {
     allocator.free(config.remote_host);
     allocator.free(config.remote_ollama);
     allocator.free(config.default_model);
+    if (config.model_facts_dir) |dir| allocator.free(dir);
+}
+
+fn builtinModelFacts(model: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, model, "jj-general")) {
+        return
+            "- `jj-general` is a custom Ollama workflow alias built from `llama3.2:3b`.\n" ++
+            "- No trusted local fine-tuning corpus is currently recorded for `jj-general` itself.\n" ++
+            "- Separate local training work exists for proof/predicate corpora, but those runs were LoRA experiments on `Qwen/Qwen2.5-0.5B-Instruct`, not `jj-general`.\n" ++
+            "- Recorded local corpora from that separate training work include:\n" ++
+            "  - `train-proof-v1` exported from `notes-proof-v1.sqlite3`\n" ++
+            "  - `FOLIO` v0.0 exported into `train-folio-v1`\n" ++
+            "  - `NaturalProofs` ProofWiki exported into `train-naturalproofs-proofwiki-v1`\n" ++
+            "- Do not claim those corpora trained `jj-general` unless newer trusted local metadata says so.";
+    }
+    if (std.mem.eql(u8, model, "jj-code")) {
+        return
+            "- `jj-code` is a custom Ollama workflow alias built from `qwen2.5-coder:3b`.\n" ++
+            "- No trusted local fine-tuning corpus is currently recorded here for `jj-code`.\n" ++
+            "- Do not invent code-training corpora beyond this note.";
+    }
+    return null;
+}
+
+fn loadModelFacts(allocator: Allocator, config: Config, model: []const u8) ![]u8 {
+    if (config.model_facts_dir) |dir| {
+        const file_name = try std.fmt.allocPrint(allocator, "{s}.md", .{model});
+        defer allocator.free(file_name);
+        const path = try std.fs.path.join(allocator, &.{ dir, file_name });
+        defer allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (file) |facts_file| {
+            defer facts_file.close();
+            return facts_file.readToEndAlloc(allocator, 64 * 1024);
+        }
+    }
+
+    if (builtinModelFacts(model)) |facts| return allocator.dupe(u8, facts);
+
+    return allocator.dupe(u8, "No trusted local model facts are available for this model.");
+}
+
+fn extractModelfileBase(allocator: Allocator, modelfile: []const u8) !?[]u8 {
+    var iter = std.mem.splitScalar(u8, modelfile, '\n');
+    while (iter.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (std.mem.startsWith(u8, line, "# FROM ")) {
+            return try allocator.dupe(u8, std.mem.trim(u8, line[7..], " \t\r"));
+        }
+    }
+
+    var fallback_iter = std.mem.splitScalar(u8, modelfile, '\n');
+    while (fallback_iter.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (std.mem.startsWith(u8, line, "FROM ")) {
+            const candidate = std.mem.trim(u8, line[5..], " \t\r");
+            if (candidate.len == 0) continue;
+            return try allocator.dupe(u8, candidate);
+        }
+    }
+
+    return null;
+}
+
+fn isSelfReferentialModelRef(model: []const u8, candidate: []const u8) bool {
+    if (std.mem.eql(u8, candidate, model)) return true;
+
+    if (candidate.len > model.len and std.mem.startsWith(u8, candidate, model) and candidate[model.len] == ':') {
+        return true;
+    }
+
+    return false;
+}
+
+fn loadOllamaLineage(allocator: Allocator, config: Config, model: []const u8) ![]u8 {
+    const modelfile = runOllama(allocator, config, &.{ "show", "--modelfile", model }) catch {
+        return allocator.dupe(u8, "Ollama lineage unavailable.");
+    };
+    defer allocator.free(modelfile);
+
+    if (try extractModelfileBase(allocator, modelfile)) |base| {
+        defer allocator.free(base);
+        if (isSelfReferentialModelRef(model, base)) {
+            return allocator.dupe(u8, "Ollama lineage unavailable.");
+        }
+        return std.fmt.allocPrint(allocator, "Ollama reports `{s}` is built from `{s}`.", .{ model, base });
+    }
+
+    return allocator.dupe(u8, "Ollama lineage unavailable.");
+}
+
+fn asciiLowerDup(allocator: Allocator, text: []const u8) ![]u8 {
+    const out = try allocator.dupe(u8, text);
+    for (out) |*ch| ch.* = std.ascii.toLower(ch.*);
+    return out;
+}
+
+fn isModelProvenanceQuestion(allocator: Allocator, prompt: []const u8) !bool {
+    const lower = try asciiLowerDup(allocator, prompt);
+    defer allocator.free(lower);
+
+    if (std.mem.indexOf(u8, lower, "trained on") != null) return true;
+    if (std.mem.indexOf(u8, lower, "training data") != null) return true;
+    if (std.mem.indexOf(u8, lower, "training corpus") != null) return true;
+    if (std.mem.indexOf(u8, lower, "training corpora") != null) return true;
+    if (std.mem.indexOf(u8, lower, "corpus") != null) return true;
+    if (std.mem.indexOf(u8, lower, "corpora") != null) return true;
+    if (std.mem.indexOf(u8, lower, "fine-tun") != null) return true;
+    if (std.mem.indexOf(u8, lower, "finetun") != null) return true;
+    return false;
+}
+
+fn formatModelProvenanceAnswer(allocator: Allocator, context: PromptContext, mode: Mode) ![]u8 {
+    const summary = if (std.mem.eql(u8, context.model, "jj-general"))
+        if (std.mem.eql(u8, context.ollama_lineage, "Ollama lineage unavailable."))
+            try allocator.dupe(u8, "`jj-general` is recorded locally as a custom Ollama alias built from `llama3.2:3b`. No trusted local fine-tuning corpus is recorded for `jj-general` itself. Separate local training work used `train-proof-v1` from `notes-proof-v1.sqlite3`, `train-folio-v1` from FOLIO, and `train-naturalproofs-proofwiki-v1` from NaturalProofs ProofWiki, but those were LoRA experiments on `Qwen/Qwen2.5-0.5B-Instruct`, not `jj-general`.")
+        else
+            try std.fmt.allocPrint(allocator, "{s} No trusted local fine-tuning corpus is recorded for `jj-general` itself. Separate local training work used `train-proof-v1` from `notes-proof-v1.sqlite3`, `train-folio-v1` from FOLIO, and `train-naturalproofs-proofwiki-v1` from NaturalProofs ProofWiki, but those were LoRA experiments on `Qwen/Qwen2.5-0.5B-Instruct`, not `jj-general`.", .{context.ollama_lineage})
+    else if (std.mem.eql(u8, context.model, "jj-code"))
+        if (std.mem.eql(u8, context.ollama_lineage, "Ollama lineage unavailable."))
+            try allocator.dupe(u8, "`jj-code` is recorded locally as a custom Ollama alias built from `qwen2.5-coder:3b`. No trusted local fine-tuning corpus is recorded for `jj-code` itself.")
+        else
+            try std.fmt.allocPrint(allocator, "{s} No trusted local fine-tuning corpus is recorded for `jj-code` itself.", .{context.ollama_lineage})
+    else if (std.mem.startsWith(u8, context.model_facts, "No trusted local model facts"))
+        if (std.mem.eql(u8, context.ollama_lineage, "Ollama lineage unavailable."))
+            try allocator.dupe(u8, "I don't know because there are no trusted local model facts recorded for this model.")
+        else
+            try std.fmt.allocPrint(allocator, "{s} No trusted local fine-tuning or corpus facts are recorded for this model.", .{context.ollama_lineage})
+    else if (std.mem.eql(u8, context.ollama_lineage, "Ollama lineage unavailable."))
+        try allocator.dupe(u8, context.model_facts)
+    else
+        try std.fmt.allocPrint(allocator, "{s} {s}", .{ context.ollama_lineage, context.model_facts });
+    defer allocator.free(summary);
+
+    return switch (mode) {
+        .normal => allocator.dupe(u8, summary),
+        .careful, .verify, .selfcheck => std.fmt.allocPrint(
+            allocator,
+            "Answer: {s}\nEvidence basis: Trusted local model facts\nConfidence: high",
+            .{summary},
+        ),
+    };
+}
+
+fn answerFromTrustedModelMetadata(allocator: Allocator, context: PromptContext, mode: Mode) ![]u8 {
+    return formatModelProvenanceAnswer(allocator, context, mode);
 }
 
 fn stripTerminalNoise(allocator: Allocator, raw: []const u8) ![]u8 {
@@ -276,9 +454,9 @@ fn draftSystemPrompt() []const u8 {
 
 fn verificationPlannerSystemPrompt() []const u8 {
     return
-        "You plan factual verification questions. Return strict JSON only. " ++
-        "Use this schema: {\"questions\":[\"...\",\"...\"]}. " ++
-        "Prefer 3 to 5 short verification questions that directly test the draft's factual claims.";
+        "You plan factual verification questions. " ++
+        "Return exactly 3 short verification questions, one per line, with no numbering, JSON, or commentary. " ++
+        "Each question should directly test a specific factual claim from the draft.";
 }
 
 fn verificationAnswerSystemPrompt() []const u8 {
@@ -314,27 +492,78 @@ fn runPrompt(allocator: Allocator, config: Config, model: []const u8, prompt: []
     return runOllama(allocator, config, &.{ "run", model, prompt });
 }
 
-fn askNormal(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8) ![]u8 {
-    return runPrompt(allocator, config, model, prompt);
+fn writePromptContextSection(writer: *std.ArrayList(u8).Writer, context: PromptContext) !void {
+    try writer.writeAll("Local minillm context:\n");
+    try writer.print("- Active selected model: {s}\n", .{context.model});
+    try writer.print("- Remote fallback host: {s}\n", .{context.remote_host});
+    try writer.print("- Ollama lineage: {s}\n", .{context.ollama_lineage});
+    try writer.writeAll("- minillm uses local Ollama when available and otherwise falls back to the remote host above.\n");
+    try writer.writeAll("- Unless the user explicitly names another model, phrases like \"this model\", \"the llm\", or follow-up clarifications refer to the active selected model above.\n");
+    try writer.writeAll("- If the user explicitly mentions \"the Mac mini\", treat that as referring to the configured remote fallback host.\n");
+    try writer.writeAll("- The trusted local model facts below are the only authoritative source for model provenance or training-corpus claims in this session.\n");
+    try writer.print("Trusted local model facts:\n{s}\n", .{context.model_facts});
 }
 
-fn askCareful(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8) ![]u8 {
-    const full_prompt = try std.fmt.allocPrint(allocator, "{s}\n\nUser question:\n{s}", .{ carefulSystemPrompt(), prompt });
+fn formatConversationHistory(allocator: Allocator, history: []const ChatTurn) ![]u8 {
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(allocator);
+
+    if (history.len == 0) {
+        try buffer.appendSlice(allocator, "No earlier conversation.\n");
+        return buffer.toOwnedSlice(allocator);
+    }
+
+    const start = if (history.len > max_history_turns) history.len - max_history_turns else 0;
+    var writer = buffer.writer(allocator);
+    for (history[start..]) |turn| {
+        const role = switch (turn.role) {
+            .user => "User",
+            .assistant => "Assistant",
+        };
+        try writer.print("{s}: {s}\n", .{ role, turn.text });
+    }
+    return buffer.toOwnedSlice(allocator);
+}
+
+fn buildPrompt(allocator: Allocator, system_prompt: []const u8, prompt: []const u8, context: PromptContext) ![]u8 {
+    const history_block = try formatConversationHistory(allocator, context.history);
+    defer allocator.free(history_block);
+
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(allocator);
+    var writer = buffer.writer(allocator);
+    try writer.print("{s}\n\n", .{system_prompt});
+    try writePromptContextSection(&writer, context);
+    try writer.print("\nRecent conversation:\n{s}\nCurrent user message:\n{s}", .{ history_block, prompt });
+    return buffer.toOwnedSlice(allocator);
+}
+
+fn askNormal(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8, context: PromptContext) ![]u8 {
+    const full_prompt = try buildPrompt(allocator, "Answer the user's latest message directly and concisely.", prompt, context);
     defer allocator.free(full_prompt);
     return runPrompt(allocator, config, model, full_prompt);
 }
 
-fn askVerify(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8) ![]u8 {
-    const draft_prompt = try std.fmt.allocPrint(allocator, "{s}\n\nUser question:\n{s}", .{ draftSystemPrompt(), prompt });
+fn askCareful(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8, context: PromptContext) ![]u8 {
+    const full_prompt = try buildPrompt(allocator, carefulSystemPrompt(), prompt, context);
+    defer allocator.free(full_prompt);
+    return runPrompt(allocator, config, model, full_prompt);
+}
+
+fn askVerify(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8, context: PromptContext) ![]u8 {
+    const draft_prompt = try buildPrompt(allocator, draftSystemPrompt(), prompt, context);
     defer allocator.free(draft_prompt);
 
     const draft = try runPrompt(allocator, config, model, draft_prompt);
     defer allocator.free(draft);
 
+    const history_block = try formatConversationHistory(allocator, context.history);
+    defer allocator.free(history_block);
+
     const planner_prompt = try std.fmt.allocPrint(
         allocator,
-        "{s}\n\nUser question:\n{s}\n\nDraft answer:\n{s}\n\nReturn exactly 3 short verification questions, one per line, with no numbering or commentary.",
-        .{ verificationPlannerSystemPrompt(), prompt, draft },
+        "{s}\n\nLocal minillm context:\n- Active selected model: {s}\n- Remote fallback host: {s}\n- Unless the user explicitly names another model, phrases like \"this model\", \"the llm\", or follow-up clarifications refer to the active selected model above.\n- If the user explicitly mentions \"the Mac mini\", treat that as referring to the configured remote fallback host.\n\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nDraft answer:\n{s}",
+        .{ verificationPlannerSystemPrompt(), context.model, context.remote_host, history_block, prompt, draft },
     );
     defer allocator.free(planner_prompt);
 
@@ -353,8 +582,8 @@ fn askVerify(allocator: Allocator, config: Config, prompt: []const u8, model: []
 
         const answer_prompt = try std.fmt.allocPrint(
             allocator,
-            "{s}\n\nOriginal user question:\n{s}\n\nVerification question:\n{s}",
-            .{ verificationAnswerSystemPrompt(), prompt, question },
+            "{s}\n\nLocal minillm context:\n- Active selected model: {s}\n- Remote fallback host: {s}\n- Unless the user explicitly names another model, phrases like \"this model\", \"the llm\", or follow-up clarifications refer to the active selected model above.\n- If the user explicitly mentions \"the Mac mini\", treat that as referring to the configured remote fallback host.\n\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nVerification question:\n{s}",
+            .{ verificationAnswerSystemPrompt(), context.model, context.remote_host, history_block, prompt, question },
         );
         defer allocator.free(answer_prompt);
 
@@ -367,19 +596,21 @@ fn askVerify(allocator: Allocator, config: Config, prompt: []const u8, model: []
 
     const final_prompt = try std.fmt.allocPrint(
         allocator,
-        "{s}\n\nOriginal user question:\n{s}\n\nInitial draft:\n{s}\n\nVerification results:\n{s}",
-        .{ verificationFinalSystemPrompt(), prompt, draft, verification_report.items },
+        "{s}\n\nLocal minillm context:\n- Active selected model: {s}\n- Remote fallback host: {s}\n- Unless the user explicitly names another model, phrases like \"this model\", \"the llm\", or follow-up clarifications refer to the active selected model above.\n- If the user explicitly mentions \"the Mac mini\", treat that as referring to the configured remote fallback host.\n\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nInitial draft:\n{s}\n\nVerification results:\n{s}",
+        .{ verificationFinalSystemPrompt(), context.model, context.remote_host, history_block, prompt, draft, verification_report.items },
     );
     defer allocator.free(final_prompt);
 
     return runPrompt(allocator, config, model, final_prompt);
 }
 
-fn askSelfCheck(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8) ![]u8 {
+fn askSelfCheck(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8, context: PromptContext) ![]u8 {
     var candidates: [3][]u8 = undefined;
     defer {
         for (candidates) |candidate| allocator.free(candidate);
     }
+    const history_block = try formatConversationHistory(allocator, context.history);
+    defer allocator.free(history_block);
 
     const sampling_labels = [_][]const u8{
         "Independent answer attempt A.",
@@ -388,19 +619,21 @@ fn askSelfCheck(allocator: Allocator, config: Config, prompt: []const u8, model:
     };
 
     for (sampling_labels, 0..) |label, idx| {
-        const sample_prompt = try std.fmt.allocPrint(
+        const sample_context_prompt = try std.fmt.allocPrint(
             allocator,
-            "{s}\n\n{s}\n\nUser question:\n{s}",
-            .{ carefulSystemPrompt(), label, prompt },
+            "{s}\n\n{s}",
+            .{ carefulSystemPrompt(), label },
         );
+        defer allocator.free(sample_context_prompt);
+        const sample_prompt = try buildPrompt(allocator, sample_context_prompt, prompt, context);
         defer allocator.free(sample_prompt);
         candidates[idx] = try runPrompt(allocator, config, model, sample_prompt);
     }
 
     const judge_prompt = try std.fmt.allocPrint(
         allocator,
-        "{s}\n\nUser question:\n{s}\n\nCandidate answer 1:\n{s}\n\nCandidate answer 2:\n{s}\n\nCandidate answer 3:\n{s}",
-        .{ selfcheckJudgeSystemPrompt(), prompt, candidates[0], candidates[1], candidates[2] },
+        "{s}\n\nLocal minillm context:\n- Active selected model: {s}\n- Remote fallback host: {s}\n- Unless the user explicitly names another model, phrases like \"this model\", \"the llm\", or follow-up clarifications refer to the active selected model above.\n- If the user explicitly mentions \"the Mac mini\", treat that as referring to the configured remote fallback host.\n\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nCandidate answer 1:\n{s}\n\nCandidate answer 2:\n{s}\n\nCandidate answer 3:\n{s}",
+        .{ selfcheckJudgeSystemPrompt(), context.model, context.remote_host, history_block, prompt, candidates[0], candidates[1], candidates[2] },
     );
     defer allocator.free(judge_prompt);
 
@@ -429,21 +662,65 @@ fn listModes(writer: *std.Io.Writer, colors: bool) !u8 {
     return 0;
 }
 
+fn showFacts(allocator: Allocator, config: Config, model: []const u8, writer: *std.Io.Writer, colors: bool) !u8 {
+    const ollama_lineage = try loadOllamaLineage(allocator, config, model);
+    defer allocator.free(ollama_lineage);
+    const model_facts = try loadModelFacts(allocator, config, model);
+    defer allocator.free(model_facts);
+
+    try printlnColor(writer, colors, Nord.title, "Model Facts");
+    try paint(writer, colors, Nord.accent, "model: ");
+    try printlnColor(writer, colors, Nord.muted, model);
+    try paint(writer, colors, Nord.accent, "ollama lineage: ");
+    try printlnColor(writer, colors, Nord.text, ollama_lineage);
+    try printlnColor(writer, colors, Nord.accent, "trusted local facts:");
+    try printlnColor(writer, colors, Nord.text, model_facts);
+    return 0;
+}
+
+fn generateAnswer(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8, mode: Mode, context: PromptContext) ![]u8 {
+    if (try isModelProvenanceQuestion(allocator, prompt)) {
+        return answerFromTrustedModelMetadata(allocator, context, mode);
+    }
+
+    return switch (mode) {
+        .normal => try askNormal(allocator, config, prompt, model, context),
+        .careful => try askCareful(allocator, config, prompt, model, context),
+        .verify => try askVerify(allocator, config, prompt, model, context),
+        .selfcheck => try askSelfCheck(allocator, config, prompt, model, context),
+    };
+}
+
+fn duplicateHistoryText(allocator: Allocator, text: []const u8) ![]u8 {
+    if (text.len <= max_history_chars) return allocator.dupe(u8, text);
+
+    const suffix = "\n[truncated]";
+    const prefix_len = max_history_chars - suffix.len;
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ text[0..prefix_len], suffix });
+}
+
+fn appendTurn(allocator: Allocator, history: *std.ArrayList(ChatTurn), role: TurnRole, text: []const u8) !void {
+    try history.append(allocator, .{
+        .role = role,
+        .text = try duplicateHistoryText(allocator, text),
+    });
+    if (history.items.len > max_history_turns) {
+        const old = history.orderedRemove(0);
+        allocator.free(old.text);
+    }
+}
+
 fn askOnce(
     allocator: Allocator,
     config: Config,
     prompt: []const u8,
     model: []const u8,
     mode: Mode,
+    context: PromptContext,
     writer: *std.Io.Writer,
     colors: bool,
 ) !u8 {
-    const output = switch (mode) {
-        .normal => try askNormal(allocator, config, prompt, model),
-        .careful => try askCareful(allocator, config, prompt, model),
-        .verify => try askVerify(allocator, config, prompt, model),
-        .selfcheck => try askSelfCheck(allocator, config, prompt, model),
-    };
+    const output = try generateAnswer(allocator, config, prompt, model, mode, context);
     defer allocator.free(output);
 
     try paint(writer, colors, Nord.accent, "model: ");
@@ -463,6 +740,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
         "  minillm ask \"your prompt\"\n" ++
         "  minillm models\n" ++
         "  minillm modes\n" ++
+        "  minillm facts [model]\n" ++
         "  minillm --mode careful ask \"your prompt\"\n" ++
         "  minillm --mode verify ask \"your prompt\"\n" ++
         "  minillm --mode selfcheck ask \"your prompt\"\n" ++
@@ -484,6 +762,15 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
     var out = std.fs.File.stdout().writer(&.{});
     var err = std.fs.File.stderr().writer(&.{});
     var mode = initial_mode;
+    const ollama_lineage = try loadOllamaLineage(allocator, config, selected_model);
+    defer allocator.free(ollama_lineage);
+    const model_facts = try loadModelFacts(allocator, config, selected_model);
+    defer allocator.free(model_facts);
+    var history: std.ArrayList(ChatTurn) = .empty;
+    defer {
+        for (history.items) |turn| allocator.free(turn.text);
+        history.deinit(allocator);
+    }
 
     try printlnColor(&out.interface, colors, Nord.title, startup_banner);
     try paint(&out.interface, colors, Nord.muted, "model: ");
@@ -539,13 +826,35 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
             continue;
         }
 
-        try printlnColor(&out.interface, colors, Nord.muted, "thinking...");
-        _ = askOnce(allocator, config, line, selected_model, mode, &out.interface, colors) catch |e| {
+        const status_line = if (try isModelProvenanceQuestion(allocator, line))
+            "checking model metadata..."
+        else
+            "thinking...";
+        try printlnColor(&out.interface, colors, Nord.muted, status_line);
+        const context: PromptContext = .{
+            .model = selected_model,
+            .remote_host = config.remote_host,
+            .ollama_lineage = ollama_lineage,
+            .model_facts = model_facts,
+            .history = history.items,
+        };
+        const output = generateAnswer(allocator, config, line, selected_model, mode, context) catch |e| {
             const msg = try std.fmt.allocPrint(allocator, "request failed: {s}", .{@errorName(e)});
             defer allocator.free(msg);
             try printlnColor(&err.interface, colors, Nord.muted, msg);
             continue;
         };
+        defer allocator.free(output);
+
+        try paint(&out.interface, colors, Nord.accent, "model: ");
+        try paint(&out.interface, colors, Nord.muted, selected_model);
+        try out.interface.writeByte('\n');
+        try paint(&out.interface, colors, Nord.accent, "mode: ");
+        try printlnColor(&out.interface, colors, Nord.muted, @tagName(mode));
+        try printlnColor(&out.interface, colors, Nord.text, output);
+
+        try appendTurn(allocator, &history, .user, line);
+        try appendTurn(allocator, &history, .assistant, output);
         try out.interface.writeByte('\n');
     }
 }
@@ -569,6 +878,10 @@ pub fn main() !void {
     defer freeConfig(allocator, config);
 
     const selected_model = parsed.model orelse config.default_model;
+    const ollama_lineage = try loadOllamaLineage(allocator, config, selected_model);
+    defer allocator.free(ollama_lineage);
+    const model_facts = try loadModelFacts(allocator, config, selected_model);
+    defer allocator.free(model_facts);
     const colors = useColor();
 
     switch (parsed.command) {
@@ -584,9 +897,18 @@ pub fn main() !void {
             var out = std.fs.File.stdout().writer(&.{});
             std.process.exit(try listModes(&out.interface, colors));
         },
+        .facts => {
+            var out = std.fs.File.stdout().writer(&.{});
+            std.process.exit(try showFacts(allocator, config, selected_model, &out.interface, colors));
+        },
         .ask => {
             var out = std.fs.File.stdout().writer(&.{});
-            std.process.exit(try askOnce(allocator, config, parsed.prompt.?, selected_model, parsed.mode, &out.interface, colors));
+            std.process.exit(try askOnce(allocator, config, parsed.prompt.?, selected_model, parsed.mode, .{
+                .model = selected_model,
+                .remote_host = config.remote_host,
+                .ollama_lineage = ollama_lineage,
+                .model_facts = model_facts,
+            }, &out.interface, colors));
         },
         .chat => std.process.exit(try runChat(allocator, config, selected_model, parsed.mode)),
     }

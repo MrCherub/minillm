@@ -52,6 +52,8 @@ Interactive mode also supports:
 - `:mode selfcheck` or `mode selfcheck`
 - `normal`, `careful`, `verify`, or `selfcheck` by themselves also switch modes
 
+Interactive chat keeps a short rolling transcript, so follow-up clarifications like "I'm talking about the Mac mini model" are grounded in the previous turn instead of being treated as a brand new standalone request.
+
 ## Anti-Hallucination Modes
 
 - `normal`
@@ -67,6 +69,7 @@ Interactive mode also supports:
   - if the samples disagree, it should abstain
 
 These modes reduce hallucinations probabilistically. They do not replace grounding or direct tool access for machine-specific facts.
+`minillm` now also injects the active selected model and configured Mac mini fallback host into prompts so references like `this model` or `the Mac mini llm` resolve more consistently.
 
 ## Defaults
 
@@ -80,6 +83,7 @@ Override with env vars:
 export MINILLM_MODEL=jj-code
 export MINILLM_REMOTE_HOST=user@example-host
 export MINILLM_REMOTE_OLLAMA=/Applications/Ollama.app/Contents/Resources/ollama
+export MINILLM_MODEL_FACTS_DIR=$HOME/.config/minillm/model-facts
 ```
 
 ## Notes
@@ -89,3 +93,5 @@ export MINILLM_REMOTE_OLLAMA=/Applications/Ollama.app/Contents/Resources/ollama
 - Set `MINILLM_REMOTE_HOST` locally to your actual Mac mini host.
 - The SSH fallback path shell-quotes prompts correctly, so apostrophes in questions work.
 - For local machine-state questions, the best long-term fix is still explicit commands or grounded local context, not prompt-only control.
+- For model provenance or training-corpus questions, `minillm` can load trusted per-model notes from `MINILLM_MODEL_FACTS_DIR/<model>.md`.
+- If no external notes are configured, `minillm` falls back to a small built-in facts block for `jj-general` and `jj-code`.
