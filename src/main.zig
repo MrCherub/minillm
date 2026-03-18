@@ -5,6 +5,8 @@ const Command = enum { chat, ask, models, modes, facts, help };
 const Mode = enum { normal, careful, verify, selfcheck };
 const max_history_turns = 6;
 const max_history_chars = 600;
+const unloaded_lineage = "__MINILLM_UNLOADED_OLLAMA_LINEAGE__";
+const unloaded_model_facts = "__MINILLM_UNLOADED_MODEL_FACTS__";
 
 const Nord = struct {
     const title = "38;2;147;194;184";
@@ -51,6 +53,10 @@ const PromptContext = struct {
     model_facts: []const u8,
     history: []const ChatTurn = &.{},
 };
+
+fn metadataIsUnloaded(value: []const u8, sentinel: []const u8) bool {
+    return std.mem.eql(u8, value, sentinel);
+}
 
 fn useColor() bool {
     if (std.process.hasEnvVarConstant("FORCE_COLOR")) return true;
@@ -312,6 +318,26 @@ fn answerFromTrustedModelMetadata(allocator: Allocator, context: PromptContext, 
     return formatModelProvenanceAnswer(allocator, context, mode);
 }
 
+fn resolvePromptContextMetadata(allocator: Allocator, config: Config, context: PromptContext) !PromptContext {
+    var resolved = context;
+    if (metadataIsUnloaded(resolved.ollama_lineage, unloaded_lineage)) {
+        resolved.ollama_lineage = try loadOllamaLineage(allocator, config, context.model);
+    }
+    if (metadataIsUnloaded(resolved.model_facts, unloaded_model_facts)) {
+        resolved.model_facts = try loadModelFacts(allocator, config, context.model);
+    }
+    return resolved;
+}
+
+fn freeResolvedPromptContextMetadata(allocator: Allocator, original: PromptContext, resolved: PromptContext) void {
+    if (!std.mem.eql(u8, resolved.ollama_lineage, original.ollama_lineage)) {
+        allocator.free(resolved.ollama_lineage);
+    }
+    if (!std.mem.eql(u8, resolved.model_facts, original.model_facts)) {
+        allocator.free(resolved.model_facts);
+    }
+}
+
 fn stripTerminalNoise(allocator: Allocator, raw: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
@@ -496,12 +522,16 @@ fn writePromptContextSection(writer: *std.ArrayList(u8).Writer, context: PromptC
     try writer.writeAll("Local minillm context:\n");
     try writer.print("- Active selected model: {s}\n", .{context.model});
     try writer.print("- Remote fallback host: {s}\n", .{context.remote_host});
-    try writer.print("- Ollama lineage: {s}\n", .{context.ollama_lineage});
     try writer.writeAll("- minillm uses local Ollama when available and otherwise falls back to the remote host above.\n");
     try writer.writeAll("- Unless the user explicitly names another model, phrases like \"this model\", \"the llm\", or follow-up clarifications refer to the active selected model above.\n");
     try writer.writeAll("- If the user explicitly mentions \"the Mac mini\", treat that as referring to the configured remote fallback host.\n");
-    try writer.writeAll("- The trusted local model facts below are the only authoritative source for model provenance or training-corpus claims in this session.\n");
-    try writer.print("Trusted local model facts:\n{s}\n", .{context.model_facts});
+    if (metadataIsUnloaded(context.ollama_lineage, unloaded_lineage) or metadataIsUnloaded(context.model_facts, unloaded_model_facts)) {
+        try writer.writeAll("- Trusted model metadata is loaded on demand for provenance or training-corpus questions.\n");
+    } else {
+        try writer.print("- Ollama lineage: {s}\n", .{context.ollama_lineage});
+        try writer.writeAll("- The trusted local model facts below are the only authoritative source for model provenance or training-corpus claims in this session.\n");
+        try writer.print("Trusted local model facts:\n{s}\n", .{context.model_facts});
+    }
 }
 
 fn formatConversationHistory(allocator: Allocator, history: []const ChatTurn) ![]u8 {
@@ -680,7 +710,9 @@ fn showFacts(allocator: Allocator, config: Config, model: []const u8, writer: *s
 
 fn generateAnswer(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8, mode: Mode, context: PromptContext) ![]u8 {
     if (try isModelProvenanceQuestion(allocator, prompt)) {
-        return answerFromTrustedModelMetadata(allocator, context, mode);
+        const resolved = try resolvePromptContextMetadata(allocator, config, context);
+        defer freeResolvedPromptContextMetadata(allocator, context, resolved);
+        return answerFromTrustedModelMetadata(allocator, resolved, mode);
     }
 
     return switch (mode) {
@@ -762,10 +794,6 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
     var out = std.fs.File.stdout().writer(&.{});
     var err = std.fs.File.stderr().writer(&.{});
     var mode = initial_mode;
-    const ollama_lineage = try loadOllamaLineage(allocator, config, selected_model);
-    defer allocator.free(ollama_lineage);
-    const model_facts = try loadModelFacts(allocator, config, selected_model);
-    defer allocator.free(model_facts);
     var history: std.ArrayList(ChatTurn) = .empty;
     defer {
         for (history.items) |turn| allocator.free(turn.text);
@@ -834,8 +862,8 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
         const context: PromptContext = .{
             .model = selected_model,
             .remote_host = config.remote_host,
-            .ollama_lineage = ollama_lineage,
-            .model_facts = model_facts,
+            .ollama_lineage = unloaded_lineage,
+            .model_facts = unloaded_model_facts,
             .history = history.items,
         };
         const output = generateAnswer(allocator, config, line, selected_model, mode, context) catch |e| {
@@ -878,10 +906,6 @@ pub fn main() !void {
     defer freeConfig(allocator, config);
 
     const selected_model = parsed.model orelse config.default_model;
-    const ollama_lineage = try loadOllamaLineage(allocator, config, selected_model);
-    defer allocator.free(ollama_lineage);
-    const model_facts = try loadModelFacts(allocator, config, selected_model);
-    defer allocator.free(model_facts);
     const colors = useColor();
 
     switch (parsed.command) {
@@ -906,8 +930,8 @@ pub fn main() !void {
             std.process.exit(try askOnce(allocator, config, parsed.prompt.?, selected_model, parsed.mode, .{
                 .model = selected_model,
                 .remote_host = config.remote_host,
-                .ollama_lineage = ollama_lineage,
-                .model_facts = model_facts,
+                .ollama_lineage = unloaded_lineage,
+                .model_facts = unloaded_model_facts,
             }, &out.interface, colors));
         },
         .chat => std.process.exit(try runChat(allocator, config, selected_model, parsed.mode)),
