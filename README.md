@@ -35,6 +35,7 @@ minillm
 minillm ask "Explain tangent spaces simply."
 minillm models
 minillm modes
+minillm refresh-facts
 minillm --mode careful ask "What corpora has this model been trained on?"
 minillm --mode verify ask "What corpora has this model been trained on?"
 minillm --mode selfcheck ask "What corpora has this model been trained on?"
@@ -90,6 +91,7 @@ export MINILLM_MODEL=jj-code
 export MINILLM_REMOTE_HOST=user@example-host
 export MINILLM_REMOTE_OLLAMA=/Applications/Ollama.app/Contents/Resources/ollama
 export MINILLM_MODEL_FACTS_DIR=$HOME/.config/minillm/model-facts
+export MINILLM_FACTS_SOURCE=$HOME/.codex/memories/jj.md
 ```
 
 ## Notes
@@ -100,4 +102,5 @@ export MINILLM_MODEL_FACTS_DIR=$HOME/.config/minillm/model-facts
 - The SSH fallback path shell-quotes prompts correctly, so apostrophes in questions work.
 - For local machine-state questions, the best long-term fix is still explicit commands or grounded local context, not prompt-only control.
 - For model provenance or training-corpus questions, `minillm` can load trusted per-model notes from `MINILLM_MODEL_FACTS_DIR/<model>.md`.
-- If no external notes are configured, `minillm` falls back to a small built-in facts block for `jj-general` and `jj-code`.
+- `minillm refresh-facts` writes those notes automatically, using Ollama lineage plus the recorded local training history from `MINILLM_FACTS_SOURCE` or `~/.codex/memories/jj.md`.
+- If no generated notes are available, `minillm` falls back to a small built-in facts block for `jj-general` and `jj-code`.

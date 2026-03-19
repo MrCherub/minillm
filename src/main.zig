@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const Command = enum { chat, ask, models, modes, facts, help };
+const Command = enum { chat, ask, models, modes, facts, refresh_facts, help };
 const Mode = enum { normal, careful, verify, selfcheck };
 const max_history_turns = 6;
 const max_history_chars = 600;
@@ -30,6 +30,7 @@ const Config = struct {
     remote_ollama: []const u8,
     default_model: []const u8,
     model_facts_dir: ?[]const u8,
+    facts_source_path: ?[]const u8,
 };
 
 const Parsed = struct {
@@ -110,6 +111,14 @@ fn parseArgs(allocator: Allocator) !Parsed {
             }
             continue;
         }
+        if (std.mem.eql(u8, arg, "refresh-facts")) {
+            parsed.command = .refresh_facts;
+            if (idx + 1 < args.len and args[idx + 1][0] != '-') {
+                idx += 1;
+                parsed.model = try allocator.dupe(u8, args[idx]);
+            }
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "help")) {
             parsed.command = .help;
             continue;
@@ -153,12 +162,14 @@ fn configFromEnv(allocator: Allocator) !Config {
     const remote_ollama = std.process.getEnvVarOwned(allocator, "MINILLM_REMOTE_OLLAMA") catch try allocator.dupe(u8, "/Applications/Ollama.app/Contents/Resources/ollama");
     const default_model = std.process.getEnvVarOwned(allocator, "MINILLM_MODEL") catch try allocator.dupe(u8, "jj-general");
     const model_facts_dir = std.process.getEnvVarOwned(allocator, "MINILLM_MODEL_FACTS_DIR") catch null;
+    const facts_source_path = std.process.getEnvVarOwned(allocator, "MINILLM_FACTS_SOURCE") catch null;
 
     return .{
         .remote_host = remote_host,
         .remote_ollama = remote_ollama,
         .default_model = default_model,
         .model_facts_dir = model_facts_dir,
+        .facts_source_path = facts_source_path,
     };
 }
 
@@ -167,6 +178,7 @@ fn freeConfig(allocator: Allocator, config: Config) void {
     allocator.free(config.remote_ollama);
     allocator.free(config.default_model);
     if (config.model_facts_dir) |dir| allocator.free(dir);
+    if (config.facts_source_path) |path| allocator.free(path);
 }
 
 fn builtinModelFacts(model: []const u8) ?[]const u8 {
@@ -193,21 +205,49 @@ fn builtinModelFacts(model: []const u8) ?[]const u8 {
     return null;
 }
 
-fn loadModelFacts(allocator: Allocator, config: Config, model: []const u8) ![]u8 {
-    if (config.model_facts_dir) |dir| {
-        const file_name = try std.fmt.allocPrint(allocator, "{s}.md", .{model});
-        defer allocator.free(file_name);
-        const path = try std.fs.path.join(allocator, &.{ dir, file_name });
-        defer allocator.free(path);
+fn defaultFactsDir(allocator: Allocator) ![]u8 {
+    if (std.process.getEnvVarOwned(allocator, "XDG_CONFIG_HOME")) |xdg_config_home| {
+        defer allocator.free(xdg_config_home);
+        return std.fs.path.join(allocator, &.{ xdg_config_home, "minillm", "model-facts" });
+    } else |_| {}
 
-        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (file) |facts_file| {
-            defer facts_file.close();
-            return facts_file.readToEndAlloc(allocator, 64 * 1024);
-        }
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".config", "minillm", "model-facts" });
+}
+
+fn configuredFactsDir(allocator: Allocator, config: Config) ![]u8 {
+    if (config.model_facts_dir) |dir| return allocator.dupe(u8, dir);
+    return defaultFactsDir(allocator);
+}
+
+fn defaultFactsSourcePath(allocator: Allocator) ![]u8 {
+    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".codex", "memories", "jj.md" });
+}
+
+fn configuredFactsSourcePath(allocator: Allocator, config: Config) ![]u8 {
+    if (config.facts_source_path) |path| return allocator.dupe(u8, path);
+    return defaultFactsSourcePath(allocator);
+}
+
+fn loadModelFacts(allocator: Allocator, config: Config, model: []const u8) ![]u8 {
+    const dir = try configuredFactsDir(allocator, config);
+    defer allocator.free(dir);
+
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.md", .{model});
+    defer allocator.free(file_name);
+    const path = try std.fs.path.join(allocator, &.{ dir, file_name });
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (file) |facts_file| {
+        defer facts_file.close();
+        return facts_file.readToEndAlloc(allocator, 64 * 1024);
     }
 
     if (builtinModelFacts(model)) |facts| return allocator.dupe(u8, facts);
@@ -264,6 +304,107 @@ fn loadOllamaLineage(allocator: Allocator, config: Config, model: []const u8) ![
     return allocator.dupe(u8, "Ollama lineage unavailable.");
 }
 
+fn isPlaceholderRemoteHost(remote_host: []const u8) bool {
+    return std.mem.eql(u8, remote_host, "user@example-host");
+}
+
+const corpus_descriptions = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "train-proof-v1", "exported from `notes-proof-v1.sqlite3`" },
+    .{ "train-folio-v1", "exported from `FOLIO` v0.0" },
+    .{ "train-naturalproofs-proofwiki-v1", "exported from `NaturalProofs` ProofWiki" },
+    .{ "train-diffcalc-v1", "from the DeepMind mathematics differentiation corpus line" },
+    .{ "train-naturalproofs-proofwiki-grounded-v1", "for retrieval-grounded NaturalProofs experiments" },
+    .{ "train-set-theory-v1", "from the formal set-theory corpus line (`set.mm`, Isabelle/ZF, AFP entries)" },
+});
+
+fn corpusDescription(dataset_id: []const u8) []const u8 {
+    return corpus_descriptions.get(dataset_id) orelse "recorded in local training history";
+}
+
+fn appendUniqueString(allocator: Allocator, items: *std.ArrayList([]u8), candidate: []const u8) !void {
+    for (items.items) |existing| {
+        if (std.mem.eql(u8, existing, candidate)) return;
+    }
+    try items.append(allocator, try allocator.dupe(u8, candidate));
+}
+
+fn collectTrainDatasetsFromText(allocator: Allocator, text: []const u8) !std.ArrayList([]u8) {
+    var items: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (items.items) |item| allocator.free(item);
+        items.deinit(allocator);
+    }
+
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (!std.mem.startsWith(u8, text[i..], "train-")) continue;
+        var j = i + "train-".len;
+        while (j < text.len) : (j += 1) {
+            const ch = text[j];
+            const allowed = std.ascii.isAlphanumeric(ch) or ch == '-';
+            if (!allowed) break;
+        }
+        if (j == i + "train-".len) continue;
+        try appendUniqueString(allocator, &items, text[i..j]);
+        i = j;
+    }
+
+    return items;
+}
+
+fn loadRecordedTrainingDatasets(allocator: Allocator, config: Config) !std.ArrayList([]u8) {
+    const source_path = configuredFactsSourcePath(allocator, config) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return .empty,
+        else => return err,
+    };
+    defer allocator.free(source_path);
+
+    const file = std.fs.openFileAbsolute(source_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .empty,
+        else => return err,
+    };
+    defer file.close();
+
+    const contents = try file.readToEndAlloc(allocator, 512 * 1024);
+    defer allocator.free(contents);
+    return collectTrainDatasetsFromText(allocator, contents);
+}
+
+fn buildGeneratedModelFacts(allocator: Allocator, config: Config, model: []const u8) ![]u8 {
+    if (std.mem.eql(u8, model, "jj-general")) {
+        var corpora = try loadRecordedTrainingDatasets(allocator, config);
+        defer {
+            for (corpora.items) |item| allocator.free(item);
+            corpora.deinit(allocator);
+        }
+
+        if (corpora.items.len == 0) {
+            if (builtinModelFacts(model)) |facts| return allocator.dupe(u8, facts);
+        }
+
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
+        var writer = output.writer(allocator);
+
+        try writer.writeAll("- `jj-general` is a custom Ollama workflow alias built from `llama3.2:3b`.\n");
+        try writer.writeAll("- No trusted local fine-tuning corpus is currently recorded for `jj-general` itself.\n");
+        try writer.writeAll("- Separate local training work exists for proof/predicate/math corpora, but those runs were LoRA experiments on `Qwen/Qwen2.5-0.5B-Instruct`, not `jj-general`.\n");
+        if (corpora.items.len == 0) {
+            try writer.writeAll("- No recorded local training corpora were found in the configured facts source.\n");
+        } else {
+            try writer.writeAll("- Recorded local corpora from that separate training work include:\n");
+            for (corpora.items) |dataset_id| {
+                try writer.print("  - `{s}` {s}\n", .{ dataset_id, corpusDescription(dataset_id) });
+            }
+        }
+        try writer.writeAll("- Do not claim those corpora trained `jj-general` unless newer trusted local metadata says so.");
+        return output.toOwnedSlice(allocator);
+    }
+
+    if (builtinModelFacts(model)) |facts| return allocator.dupe(u8, facts);
+    return allocator.dupe(u8, "No trusted local model facts are available for this model.");
+}
+
 fn asciiLowerDup(allocator: Allocator, text: []const u8) ![]u8 {
     const out = try allocator.dupe(u8, text);
     for (out) |*ch| ch.* = std.ascii.toLower(ch.*);
@@ -286,17 +427,7 @@ fn isModelProvenanceQuestion(allocator: Allocator, prompt: []const u8) !bool {
 }
 
 fn formatModelProvenanceAnswer(allocator: Allocator, context: PromptContext, mode: Mode) ![]u8 {
-    const summary = if (std.mem.eql(u8, context.model, "jj-general"))
-        if (std.mem.eql(u8, context.ollama_lineage, "Ollama lineage unavailable."))
-            try allocator.dupe(u8, "`jj-general` is recorded locally as a custom Ollama alias built from `llama3.2:3b`. No trusted local fine-tuning corpus is recorded for `jj-general` itself. Separate local training work used `train-proof-v1` from `notes-proof-v1.sqlite3`, `train-folio-v1` from FOLIO, and `train-naturalproofs-proofwiki-v1` from NaturalProofs ProofWiki, but those were LoRA experiments on `Qwen/Qwen2.5-0.5B-Instruct`, not `jj-general`.")
-        else
-            try std.fmt.allocPrint(allocator, "{s} No trusted local fine-tuning corpus is recorded for `jj-general` itself. Separate local training work used `train-proof-v1` from `notes-proof-v1.sqlite3`, `train-folio-v1` from FOLIO, and `train-naturalproofs-proofwiki-v1` from NaturalProofs ProofWiki, but those were LoRA experiments on `Qwen/Qwen2.5-0.5B-Instruct`, not `jj-general`.", .{context.ollama_lineage})
-    else if (std.mem.eql(u8, context.model, "jj-code"))
-        if (std.mem.eql(u8, context.ollama_lineage, "Ollama lineage unavailable."))
-            try allocator.dupe(u8, "`jj-code` is recorded locally as a custom Ollama alias built from `qwen2.5-coder:3b`. No trusted local fine-tuning corpus is recorded for `jj-code` itself.")
-        else
-            try std.fmt.allocPrint(allocator, "{s} No trusted local fine-tuning corpus is recorded for `jj-code` itself.", .{context.ollama_lineage})
-    else if (std.mem.startsWith(u8, context.model_facts, "No trusted local model facts"))
+    const summary = if (std.mem.startsWith(u8, context.model_facts, "No trusted local model facts"))
         if (std.mem.eql(u8, context.ollama_lineage, "Ollama lineage unavailable."))
             try allocator.dupe(u8, "I don't know because there are no trusted local model facts recorded for this model.")
         else
@@ -304,7 +435,7 @@ fn formatModelProvenanceAnswer(allocator: Allocator, context: PromptContext, mod
     else if (std.mem.eql(u8, context.ollama_lineage, "Ollama lineage unavailable."))
         try allocator.dupe(u8, context.model_facts)
     else
-        try std.fmt.allocPrint(allocator, "{s} {s}", .{ context.ollama_lineage, context.model_facts });
+        try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ context.ollama_lineage, context.model_facts });
     defer allocator.free(summary);
 
     return switch (mode) {
@@ -452,6 +583,7 @@ fn runOllama(allocator: Allocator, config: Config, argv_tail: []const []const u8
 
     return runChild(allocator, local_args.items) catch |err| switch (err) {
         error.FileNotFound => {
+            if (isPlaceholderRemoteHost(config.remote_host)) return error.RemoteHostNotConfigured;
             const remote_command = try buildRemoteCommand(allocator, config.remote_ollama, argv_tail);
             defer allocator.free(remote_command);
 
@@ -711,6 +843,59 @@ fn showFacts(allocator: Allocator, config: Config, model: []const u8, writer: *s
     return 0;
 }
 
+fn writeModelFactsFile(allocator: Allocator, facts_dir: []const u8, model: []const u8, contents: []const u8) ![]u8 {
+    var root_dir = try std.fs.openDirAbsolute("/", .{});
+    defer root_dir.close();
+    try root_dir.makePath(std.mem.trimLeft(u8, facts_dir, "/"));
+
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.md", .{model});
+    defer allocator.free(file_name);
+    const path = try std.fs.path.join(allocator, &.{ facts_dir, file_name });
+
+    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(contents);
+    return path;
+}
+
+fn refreshFacts(allocator: Allocator, config: Config, selected_model: ?[]const u8, writer: *std.Io.Writer, colors: bool) !u8 {
+    const facts_dir = try configuredFactsDir(allocator, config);
+    defer allocator.free(facts_dir);
+
+    const default_models = [_][]const u8{ "jj-general", "jj-code" };
+
+    try printlnColor(writer, colors, Nord.title, "Refreshing model facts");
+    try paint(writer, colors, Nord.accent, "facts dir: ");
+    try printlnColor(writer, colors, Nord.text, facts_dir);
+
+    if (selected_model) |model| {
+        const generated = try buildGeneratedModelFacts(allocator, config, model);
+        defer allocator.free(generated);
+        const path = try writeModelFactsFile(allocator, facts_dir, model, generated);
+        defer allocator.free(path);
+
+        try paint(writer, colors, Nord.accent, "updated: ");
+        try paint(writer, colors, Nord.muted, model);
+        try writer.writeAll(" -> ");
+        try printlnColor(writer, colors, Nord.text, path);
+        return 0;
+    }
+
+    for (default_models) |model| {
+        const generated = try buildGeneratedModelFacts(allocator, config, model);
+        defer allocator.free(generated);
+        const path = try writeModelFactsFile(allocator, facts_dir, model, generated);
+        defer allocator.free(path);
+
+        try paint(writer, colors, Nord.accent, "updated: ");
+        try paint(writer, colors, Nord.muted, model);
+        try writer.writeAll(" -> ");
+        try printlnColor(writer, colors, Nord.text, path);
+    }
+
+    return 0;
+}
+
 fn generateAnswer(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8, mode: Mode, context: PromptContext) ![]u8 {
     if (try isModelProvenanceQuestion(allocator, prompt)) {
         const resolved = try resolvePromptContextMetadata(allocator, config, context);
@@ -776,6 +961,7 @@ fn printHelp(writer: *std.Io.Writer) !void {
         "  minillm models\n" ++
         "  minillm modes\n" ++
         "  minillm facts [model]\n" ++
+        "  minillm refresh-facts [model]\n" ++
         "  minillm --mode careful ask \"your prompt\"\n" ++
         "  minillm --mode verify ask \"your prompt\"\n" ++
         "  minillm --mode selfcheck ask \"your prompt\"\n" ++
@@ -790,7 +976,9 @@ fn printHelp(writer: *std.Io.Writer) !void {
         "Env:\n" ++
         "  MINILLM_MODEL         default model (default: jj-general)\n" ++
         "  MINILLM_REMOTE_HOST   ssh host fallback (default: user@example-host)\n" ++
-        "  MINILLM_REMOTE_OLLAMA remote ollama binary path\n\n" ++
+        "  MINILLM_REMOTE_OLLAMA remote ollama binary path\n" ++
+        "  MINILLM_MODEL_FACTS_DIR facts directory (default: $XDG_CONFIG_HOME/minillm/model-facts or ~/.config/minillm/model-facts)\n" ++
+        "  MINILLM_FACTS_SOURCE  training-history source file (default: ~/.codex/memories/jj.md)\n\n" ++
         "Modes:\n" ++
         "  normal     Plain answer generation\n" ++
         "  careful    Abstention-first prompting\n" ++
@@ -956,6 +1144,10 @@ pub fn main() !void {
         .facts => {
             var out = std.fs.File.stdout().writer(&.{});
             std.process.exit(try showFacts(allocator, config, selected_model, &out.interface, colors));
+        },
+        .refresh_facts => {
+            var out = std.fs.File.stdout().writer(&.{});
+            std.process.exit(try refreshFacts(allocator, config, parsed.model, &out.interface, colors));
         },
         .ask => {
             var out = std.fs.File.stdout().writer(&.{});
