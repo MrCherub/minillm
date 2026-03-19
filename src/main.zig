@@ -179,6 +179,9 @@ fn builtinModelFacts(model: []const u8) ?[]const u8 {
             "  - `train-proof-v1` exported from `notes-proof-v1.sqlite3`\n" ++
             "  - `FOLIO` v0.0 exported into `train-folio-v1`\n" ++
             "  - `NaturalProofs` ProofWiki exported into `train-naturalproofs-proofwiki-v1`\n" ++
+            "  - `train-diffcalc-v1` from the DeepMind mathematics differentiation corpus line\n" ++
+            "  - `train-naturalproofs-proofwiki-grounded-v1` for retrieval-grounded NaturalProofs experiments\n" ++
+            "  - `train-set-theory-v1` from the formal set-theory corpus line (`set.mm`, Isabelle/ZF, AFP entries)\n" ++
             "- Do not claim those corpora trained `jj-general` unless newer trusted local metadata says so.";
     }
     if (std.mem.eql(u8, model, "jj-code")) {
@@ -777,6 +780,13 @@ fn printHelp(writer: *std.Io.Writer) !void {
         "  minillm --mode verify ask \"your prompt\"\n" ++
         "  minillm --mode selfcheck ask \"your prompt\"\n" ++
         "  minillm --model jj-code ask \"fix this shell command\"\n\n" ++
+        "Chat commands:\n" ++
+        "  :q                 quit\n" ++
+        "  :models            list available models\n" ++
+        "  :modes             list available modes\n" ++
+        "  :mode <name>       switch chat mode\n" ++
+        "  :model             show current chat model\n" ++
+        "  :model <name>      switch current chat model\n\n" ++
         "Env:\n" ++
         "  MINILLM_MODEL         default model (default: jj-general)\n" ++
         "  MINILLM_REMOTE_HOST   ssh host fallback (default: user@example-host)\n" ++
@@ -794,6 +804,8 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
     var out = std.fs.File.stdout().writer(&.{});
     var err = std.fs.File.stderr().writer(&.{});
     var mode = initial_mode;
+    var current_model = try allocator.dupe(u8, selected_model);
+    defer allocator.free(current_model);
     var history: std.ArrayList(ChatTurn) = .empty;
     defer {
         for (history.items) |turn| allocator.free(turn.text);
@@ -802,10 +814,10 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
 
     try printlnColor(&out.interface, colors, Nord.title, startup_banner);
     try paint(&out.interface, colors, Nord.muted, "model: ");
-    try printlnColor(&out.interface, colors, Nord.accent, selected_model);
+    try printlnColor(&out.interface, colors, Nord.accent, current_model);
     try paint(&out.interface, colors, Nord.muted, "mode: ");
     try printlnColor(&out.interface, colors, Nord.accent, @tagName(mode));
-    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models/models to list models, :modes/modes to list modes, :mode/mode normal|careful|verify|selfcheck, or just normal/careful/verify/selfcheck.");
+    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models/models to list models, :modes/modes to list modes, :mode/mode normal|careful|verify|selfcheck, :model/model [name] to show or switch model, or just normal/careful/verify/selfcheck.");
 
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
@@ -828,6 +840,26 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
         if (std.mem.eql(u8, line, ":modes") or std.mem.eql(u8, line, "modes")) {
             _ = try listModes(&out.interface, colors);
             try out.interface.writeByte('\n');
+            continue;
+        }
+        if (std.mem.eql(u8, line, ":model") or std.mem.eql(u8, line, "model")) {
+            try paint(&out.interface, colors, Nord.muted, "model: ");
+            try printlnColor(&out.interface, colors, Nord.accent, current_model);
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, ":model ") or std.mem.startsWith(u8, line, "model ")) {
+            const next_model = if (std.mem.startsWith(u8, line, ":model "))
+                std.mem.trim(u8, line[7..], " \t")
+            else
+                std.mem.trim(u8, line[6..], " \t");
+            if (next_model.len == 0) {
+                try printlnColor(&err.interface, colors, Nord.muted, "missing model name");
+                continue;
+            }
+            allocator.free(current_model);
+            current_model = try allocator.dupe(u8, next_model);
+            try paint(&out.interface, colors, Nord.muted, "model: ");
+            try printlnColor(&out.interface, colors, Nord.accent, current_model);
             continue;
         }
         if (std.mem.startsWith(u8, line, ":mode ") or std.mem.startsWith(u8, line, "mode ") or std.mem.eql(u8, line, "normal") or std.mem.eql(u8, line, "careful") or std.mem.eql(u8, line, "verify") or std.mem.eql(u8, line, "selfcheck")) {
@@ -860,13 +892,13 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
             "thinking...";
         try printlnColor(&out.interface, colors, Nord.muted, status_line);
         const context: PromptContext = .{
-            .model = selected_model,
+            .model = current_model,
             .remote_host = config.remote_host,
             .ollama_lineage = unloaded_lineage,
             .model_facts = unloaded_model_facts,
             .history = history.items,
         };
-        const output = generateAnswer(allocator, config, line, selected_model, mode, context) catch |e| {
+        const output = generateAnswer(allocator, config, line, current_model, mode, context) catch |e| {
             const msg = try std.fmt.allocPrint(allocator, "request failed: {s}", .{@errorName(e)});
             defer allocator.free(msg);
             try printlnColor(&err.interface, colors, Nord.muted, msg);
@@ -875,7 +907,7 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
         defer allocator.free(output);
 
         try paint(&out.interface, colors, Nord.accent, "model: ");
-        try paint(&out.interface, colors, Nord.muted, selected_model);
+        try paint(&out.interface, colors, Nord.muted, current_model);
         try out.interface.writeByte('\n');
         try paint(&out.interface, colors, Nord.accent, "mode: ");
         try printlnColor(&out.interface, colors, Nord.muted, @tagName(mode));

@@ -71,6 +71,12 @@ Interactive chat keeps a short rolling transcript, so follow-up clarifications l
 These modes reduce hallucinations probabilistically. They do not replace grounding or direct tool access for machine-specific facts.
 `minillm` now also injects the active selected model and configured Mac mini fallback host into prompts so references like `this model` or `the Mac mini llm` resolve more consistently.
 
+In chat mode you can inspect or switch the session model without restarting:
+
+- `:model` shows the current model
+- `:model jj-code` switches to `jj-code`
+- `:model jj-general` switches back
+
 ## Defaults
 
 - model: `jj-general`
