@@ -447,19 +447,68 @@ fn asciiLowerDup(allocator: Allocator, text: []const u8) ![]u8 {
     return out;
 }
 
+fn containsAny(text: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (std.mem.indexOf(u8, text, needle) != null) return true;
+    }
+    return false;
+}
+
 fn isModelProvenanceQuestion(allocator: Allocator, prompt: []const u8) !bool {
     const lower = try asciiLowerDup(allocator, prompt);
     defer allocator.free(lower);
 
-    if (std.mem.indexOf(u8, lower, "trained on") != null) return true;
-    if (std.mem.indexOf(u8, lower, "training data") != null) return true;
-    if (std.mem.indexOf(u8, lower, "training corpus") != null) return true;
-    if (std.mem.indexOf(u8, lower, "training corpora") != null) return true;
-    if (std.mem.indexOf(u8, lower, "corpus") != null) return true;
-    if (std.mem.indexOf(u8, lower, "corpora") != null) return true;
-    if (std.mem.indexOf(u8, lower, "fine-tun") != null) return true;
-    if (std.mem.indexOf(u8, lower, "finetun") != null) return true;
+    const direct_provenance_phrases = [_][]const u8{
+        "trained on",
+        "training data",
+        "training corpus",
+        "training corpora",
+        "fine-tun",
+        "finetun",
+        "fine tun",
+        "what corpora have you been trained on",
+        "what corpus have you been trained on",
+    };
+    if (containsAny(lower, &direct_provenance_phrases)) return true;
+
+    const corpus_terms = [_][]const u8{
+        "corpus",
+        "corpora",
+        "dataset",
+        "datasets",
+    };
+    if (!containsAny(lower, &corpus_terms)) return false;
+
+    const model_context_terms = [_][]const u8{
+        "model",
+        "llm",
+        "trained",
+        "training",
+        "fine-tun",
+        "finetun",
+        "jj-general",
+        "jj-code",
+        "minillm",
+        "you",
+        "your",
+    };
+    if (containsAny(lower, &model_context_terms)) return true;
+
     return false;
+}
+
+test "model provenance detection catches explicit training questions" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(try isModelProvenanceQuestion(allocator, "what corpora have you been trained on"));
+    try std.testing.expect(try isModelProvenanceQuestion(allocator, "list your training data"));
+    try std.testing.expect(try isModelProvenanceQuestion(allocator, "which dataset was jj-general fine-tuned on?"));
+}
+
+test "model provenance detection avoids set theory false positives" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(!(try isModelProvenanceQuestion(allocator, "give me a proof for set theory")));
+    try std.testing.expect(!(try isModelProvenanceQuestion(allocator, "explain set theory")));
+    try std.testing.expect(!(try isModelProvenanceQuestion(allocator, "write a proof about corpora in set theory notation")));
 }
 
 fn formatModelProvenanceAnswer(allocator: Allocator, context: PromptContext, mode: Mode) ![]u8 {
@@ -821,10 +870,35 @@ fn runPrompt(allocator: Allocator, config: Config, model: []const u8, prompt: []
     return runOllama(allocator, config, &.{ "run", model, prompt });
 }
 
-fn writePromptContextSection(writer: *std.ArrayList(u8).Writer, context: PromptContext) !void {
+fn loadCurrentDateTimeContext(allocator: Allocator) ![]u8 {
+    const timestamp = std.time.timestamp();
+    const date_output = runChildBlocking(allocator, &.{ "/bin/date", "+%Y-%m-%d %H:%M:%S %Z (%z)" }) catch null;
+    defer if (date_output) |value| allocator.free(value);
+
+    if (date_output) |value| {
+        if (value.len != 0) {
+            return std.fmt.allocPrint(
+                allocator,
+                "{s} | unix={d}",
+                .{ value, timestamp },
+            );
+        }
+    }
+
+    return std.fmt.allocPrint(allocator, "unix={d}", .{timestamp});
+}
+
+fn formatPromptContextSection(allocator: Allocator, context: PromptContext) ![]u8 {
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(allocator);
+    var writer = buffer.writer(allocator);
+    const current_datetime = try loadCurrentDateTimeContext(allocator);
+    defer allocator.free(current_datetime);
+
     try writer.writeAll("Local minillm context:\n");
     try writer.print("- Active selected model: {s}\n", .{context.model});
     try writer.print("- Remote fallback host: {s}\n", .{context.remote_host});
+    try writer.print("- Current local date/time: {s}\n", .{current_datetime});
     try writer.writeAll("- minillm uses local Ollama when available and otherwise falls back to the remote host above.\n");
     try writer.writeAll("- Unless the user explicitly names another model, phrases like \"this model\", \"the llm\", or follow-up clarifications refer to the active selected model above.\n");
     try writer.writeAll("- If the user explicitly mentions \"the Mac mini\", treat that as referring to the configured remote fallback host.\n");
@@ -835,6 +909,7 @@ fn writePromptContextSection(writer: *std.ArrayList(u8).Writer, context: PromptC
         try writer.writeAll("- The trusted local model facts below are the only authoritative source for model provenance or training-corpus claims in this session.\n");
         try writer.print("Trusted local model facts:\n{s}\n", .{context.model_facts});
     }
+    return buffer.toOwnedSlice(allocator);
 }
 
 fn formatConversationHistory(allocator: Allocator, history: []const ChatTurn) ![]u8 {
@@ -861,12 +936,14 @@ fn formatConversationHistory(allocator: Allocator, history: []const ChatTurn) ![
 fn buildPrompt(allocator: Allocator, system_prompt: []const u8, prompt: []const u8, context: PromptContext) ![]u8 {
     const history_block = try formatConversationHistory(allocator, context.history);
     defer allocator.free(history_block);
+    const prompt_context = try formatPromptContextSection(allocator, context);
+    defer allocator.free(prompt_context);
 
     var buffer: std.ArrayList(u8) = .empty;
     errdefer buffer.deinit(allocator);
     var writer = buffer.writer(allocator);
     try writer.print("{s}\n\n", .{system_prompt});
-    try writePromptContextSection(&writer, context);
+    try writer.writeAll(prompt_context);
     try writer.print("\nRecent conversation:\n{s}\nCurrent user message:\n{s}", .{ history_block, prompt });
     return buffer.toOwnedSlice(allocator);
 }
@@ -892,11 +969,13 @@ fn askVerify(allocator: Allocator, config: Config, prompt: []const u8, model: []
 
     const history_block = try formatConversationHistory(allocator, context.history);
     defer allocator.free(history_block);
+    const prompt_context = try formatPromptContextSection(allocator, context);
+    defer allocator.free(prompt_context);
 
     const planner_prompt = try std.fmt.allocPrint(
         allocator,
-        "{s}\n\nLocal minillm context:\n- Active selected model: {s}\n- Remote fallback host: {s}\n- Unless the user explicitly names another model, phrases like \"this model\", \"the llm\", or follow-up clarifications refer to the active selected model above.\n- If the user explicitly mentions \"the Mac mini\", treat that as referring to the configured remote fallback host.\n\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nDraft answer:\n{s}",
-        .{ verificationPlannerSystemPrompt(), context.model, context.remote_host, history_block, prompt, draft },
+        "{s}\n\n{s}\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nDraft answer:\n{s}",
+        .{ verificationPlannerSystemPrompt(), prompt_context, history_block, prompt, draft },
     );
     defer allocator.free(planner_prompt);
 
@@ -915,8 +994,8 @@ fn askVerify(allocator: Allocator, config: Config, prompt: []const u8, model: []
 
         const answer_prompt = try std.fmt.allocPrint(
             allocator,
-            "{s}\n\nLocal minillm context:\n- Active selected model: {s}\n- Remote fallback host: {s}\n- Unless the user explicitly names another model, phrases like \"this model\", \"the llm\", or follow-up clarifications refer to the active selected model above.\n- If the user explicitly mentions \"the Mac mini\", treat that as referring to the configured remote fallback host.\n\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nVerification question:\n{s}",
-            .{ verificationAnswerSystemPrompt(), context.model, context.remote_host, history_block, prompt, question },
+            "{s}\n\n{s}\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nVerification question:\n{s}",
+            .{ verificationAnswerSystemPrompt(), prompt_context, history_block, prompt, question },
         );
         defer allocator.free(answer_prompt);
 
@@ -929,8 +1008,8 @@ fn askVerify(allocator: Allocator, config: Config, prompt: []const u8, model: []
 
     const final_prompt = try std.fmt.allocPrint(
         allocator,
-        "{s}\n\nLocal minillm context:\n- Active selected model: {s}\n- Remote fallback host: {s}\n- Unless the user explicitly names another model, phrases like \"this model\", \"the llm\", or follow-up clarifications refer to the active selected model above.\n- If the user explicitly mentions \"the Mac mini\", treat that as referring to the configured remote fallback host.\n\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nInitial draft:\n{s}\n\nVerification results:\n{s}",
-        .{ verificationFinalSystemPrompt(), context.model, context.remote_host, history_block, prompt, draft, verification_report.items },
+        "{s}\n\n{s}\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nInitial draft:\n{s}\n\nVerification results:\n{s}",
+        .{ verificationFinalSystemPrompt(), prompt_context, history_block, prompt, draft, verification_report.items },
     );
     defer allocator.free(final_prompt);
 
@@ -944,6 +1023,8 @@ fn askSelfCheck(allocator: Allocator, config: Config, prompt: []const u8, model:
     }
     const history_block = try formatConversationHistory(allocator, context.history);
     defer allocator.free(history_block);
+    const prompt_context = try formatPromptContextSection(allocator, context);
+    defer allocator.free(prompt_context);
 
     const sampling_labels = [_][]const u8{
         "Independent answer attempt A.",
@@ -965,8 +1046,8 @@ fn askSelfCheck(allocator: Allocator, config: Config, prompt: []const u8, model:
 
     const judge_prompt = try std.fmt.allocPrint(
         allocator,
-        "{s}\n\nLocal minillm context:\n- Active selected model: {s}\n- Remote fallback host: {s}\n- Unless the user explicitly names another model, phrases like \"this model\", \"the llm\", or follow-up clarifications refer to the active selected model above.\n- If the user explicitly mentions \"the Mac mini\", treat that as referring to the configured remote fallback host.\n\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nCandidate answer 1:\n{s}\n\nCandidate answer 2:\n{s}\n\nCandidate answer 3:\n{s}",
-        .{ selfcheckJudgeSystemPrompt(), context.model, context.remote_host, history_block, prompt, candidates[0], candidates[1], candidates[2] },
+        "{s}\n\n{s}\nRecent conversation:\n{s}\nCurrent user message:\n{s}\n\nCandidate answer 1:\n{s}\n\nCandidate answer 2:\n{s}\n\nCandidate answer 3:\n{s}",
+        .{ selfcheckJudgeSystemPrompt(), prompt_context, history_block, prompt, candidates[0], candidates[1], candidates[2] },
     );
     defer allocator.free(judge_prompt);
 

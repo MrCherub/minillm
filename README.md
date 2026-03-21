@@ -40,6 +40,7 @@ minillm --mode careful ask "What corpora has this model been trained on?"
 minillm --mode verify ask "What corpora has this model been trained on?"
 minillm --mode selfcheck ask "What corpora has this model been trained on?"
 minillm --model jj-code ask "Write a zsh one-liner to list PDFs."
+zig build test
 ```
 
 Interactive mode also supports:
@@ -71,6 +72,7 @@ Interactive chat keeps a short rolling transcript, so follow-up clarifications l
 
 These modes reduce hallucinations probabilistically. They do not replace grounding or direct tool access for machine-specific facts.
 `minillm` now also injects the active selected model and configured Mac mini fallback host into prompts so references like `this model` or `the Mac mini llm` resolve more consistently.
+It also injects the current local date/time into prompt context so time-sensitive prompts have an explicit clock reference.
 
 In chat mode you can inspect or switch the session model without restarting:
 
