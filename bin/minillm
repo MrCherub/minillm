@@ -1,6 +1,16 @@
 #!/bin/zsh
 set -euo pipefail
-repo_dir="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+script_path="${0:A}"
+while [[ -L "$script_path" ]]; do
+  link_target="$(readlink "$script_path")"
+  if [[ "$link_target" = /* ]]; then
+    script_path="$link_target"
+  else
+    script_dir="$(cd -- "$(dirname -- "$script_path")" && pwd)"
+    script_path="$(cd -- "$script_dir/$(dirname -- "$link_target")" && pwd)/$(basename -- "$link_target")"
+  fi
+done
+repo_dir="$(cd -- "$(dirname -- "$script_path")/.." && pwd)"
 bin="$repo_dir/zig-out/bin/minillm"
 export MINILLM_REMOTE_HOST="${MINILLM_REMOTE_HOST:-user@example-host}"
 if [[ ! -x "$bin" || "$repo_dir/src/main.zig" -nt "$bin" || "$repo_dir/build.zig" -nt "$bin" || "$repo_dir/build.zig.zon" -nt "$bin" ]]; then
