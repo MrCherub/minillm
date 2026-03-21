@@ -7,6 +7,7 @@ const max_history_turns = 6;
 const max_history_chars = 600;
 const unloaded_lineage = "__MINILLM_UNLOADED_OLLAMA_LINEAGE__";
 const unloaded_model_facts = "__MINILLM_UNLOADED_MODEL_FACTS__";
+threadlocal var interactive_cancel_enabled = false;
 
 const Nord = struct {
     const title = "38;2;147;194;184";
@@ -229,7 +230,32 @@ fn configuredFactsDir(allocator: Allocator, config: Config) ![]u8 {
 fn defaultFactsSourcePath(allocator: Allocator) ![]u8 {
     const home = try std.process.getEnvVarOwned(allocator, "HOME");
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".codex", "memories", "jj.md" });
+    const memories_dir = try std.fs.path.join(allocator, &.{ home, ".codex", "memories" });
+    defer allocator.free(memories_dir);
+
+    var dir = std.fs.openDirAbsolute(memories_dir, .{ .iterate = true }) catch {
+        return std.fs.path.join(allocator, &.{ home, ".codex", "memories", "memory.md" });
+    };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    var selected_name: ?[]u8 = null;
+    defer if (selected_name) |name| allocator.free(name);
+
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+        if (selected_name == null or std.mem.lessThan(u8, entry.name, selected_name.?)) {
+            if (selected_name) |old| allocator.free(old);
+            selected_name = try allocator.dupe(u8, entry.name);
+        }
+    }
+
+    if (selected_name) |name| {
+        return std.fs.path.join(allocator, &.{ memories_dir, name });
+    }
+
+    return std.fs.path.join(allocator, &.{ home, ".codex", "memories", "memory.md" });
 }
 
 fn configuredFactsSourcePath(allocator: Allocator, config: Config) ![]u8 {
@@ -522,6 +548,14 @@ fn stripTerminalNoise(allocator: Allocator, raw: []const u8) ![]u8 {
 }
 
 fn runChild(allocator: Allocator, argv: []const []const u8) ![]u8 {
+    if (interactive_cancel_enabled) {
+        return runChildCancelable(allocator, argv);
+    }
+
+    return runChildBlocking(allocator, argv);
+}
+
+fn runChildBlocking(allocator: Allocator, argv: []const []const u8) ![]u8 {
     var child = std.process.Child.init(argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
@@ -552,6 +586,130 @@ fn runChild(allocator: Allocator, argv: []const []const u8) ![]u8 {
         else => {
             return error.CommandFailed;
         },
+    }
+
+    const stdout_owned = try stdout.toOwnedSlice(allocator);
+    defer allocator.free(stdout_owned);
+    const clean = try stripTerminalNoise(allocator, stdout_owned);
+    return clean;
+}
+
+const RawStdinGuard = struct {
+    enabled: bool = false,
+    handle: std.posix.fd_t = undefined,
+    original_termios: std.posix.termios = undefined,
+
+    fn init() !RawStdinGuard {
+        const handle = std.fs.File.stdin().handle;
+        if (!std.posix.isatty(handle)) return .{};
+
+        const original_termios = try std.posix.tcgetattr(handle);
+        var raw = original_termios;
+        raw.lflag.ECHO = false;
+        raw.lflag.ICANON = false;
+        raw.cc[@intFromEnum(std.posix.V.MIN)] = 0;
+        raw.cc[@intFromEnum(std.posix.V.TIME)] = 1;
+        try std.posix.tcsetattr(handle, .NOW, raw);
+
+        return .{
+            .enabled = true,
+            .handle = handle,
+            .original_termios = original_termios,
+        };
+    }
+
+    fn deinit(self: *RawStdinGuard) void {
+        if (!self.enabled) return;
+        std.posix.tcsetattr(self.handle, .NOW, self.original_termios) catch {};
+    }
+};
+
+const CancelWatcher = struct {
+    pid: std.process.Child.Id,
+    stdin_handle: std.posix.fd_t,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *CancelWatcher) void {
+        var buf: [16]u8 = undefined;
+        var consecutive_escapes: u8 = 0;
+
+        while (!self.done.load(.acquire)) {
+            const bytes_read = std.posix.read(self.stdin_handle, &buf) catch {
+                std.Thread.sleep(20 * std.time.ns_per_ms);
+                continue;
+            };
+            if (bytes_read == 0) continue;
+
+            for (buf[0..bytes_read]) |byte| {
+                if (byte == 0x1b) {
+                    consecutive_escapes += 1;
+                    if (consecutive_escapes >= 2) {
+                        self.cancelled.store(true, .release);
+                        std.posix.kill(self.pid, std.posix.SIG.TERM) catch {};
+                        return;
+                    }
+                } else {
+                    consecutive_escapes = 0;
+                }
+            }
+        }
+    }
+};
+
+fn runChildCancelable(allocator: Allocator, argv: []const []const u8) ![]u8 {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    try child.spawn();
+    errdefer _ = child.kill() catch {};
+
+    var stdin_guard = RawStdinGuard.init() catch RawStdinGuard{};
+    defer stdin_guard.deinit();
+
+    var watcher = CancelWatcher{
+        .pid = child.id,
+        .stdin_handle = std.fs.File.stdin().handle,
+    };
+    const watcher_thread = if (stdin_guard.enabled)
+        try std.Thread.spawn(.{}, CancelWatcher.run, .{&watcher})
+    else
+        null;
+    defer {
+        watcher.done.store(true, .release);
+        if (watcher_thread) |thread| thread.join();
+    }
+
+    child.collectOutput(allocator, &stdout, &stderr, 1024 * 1024) catch |err| {
+        if (watcher.cancelled.load(.acquire)) {
+            _ = child.wait() catch {};
+            return error.Cancelled;
+        }
+        return err;
+    };
+
+    const term = try child.wait();
+    if (watcher.cancelled.load(.acquire)) return error.Cancelled;
+
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                const stderr_owned = try stderr.toOwnedSlice(allocator);
+                defer allocator.free(stderr_owned);
+                const stderr_clean = try stripTerminalNoise(allocator, stderr_owned);
+                defer allocator.free(stderr_clean);
+                if (stderr_clean.len > 0) std.debug.print("{s}\n", .{stderr_clean});
+                return error.CommandFailed;
+            }
+        },
+        else => return error.CommandFailed,
     }
 
     const stdout_owned = try stdout.toOwnedSlice(allocator);
@@ -983,12 +1141,14 @@ fn printHelp(writer: *std.Io.Writer) !void {
         "  :mode <name>       switch chat mode\n" ++
         "  :model             show current chat model\n" ++
         "  :model <name>      switch current chat model\n\n" ++
+        "During chat requests:\n" ++
+        "  Esc Esc            cancel the current thinking/request\n\n" ++
         "Env:\n" ++
         "  MINILLM_MODEL         default model (default: jj-general)\n" ++
         "  MINILLM_REMOTE_HOST   ssh host fallback (default: user@example-host)\n" ++
         "  MINILLM_REMOTE_OLLAMA remote ollama binary path\n" ++
         "  MINILLM_MODEL_FACTS_DIR facts directory (default: $XDG_CONFIG_HOME/minillm/model-facts or ~/.config/minillm/model-facts)\n" ++
-        "  MINILLM_FACTS_SOURCE  training-history source file (default: ~/.codex/memories/jj.md)\n\n" ++
+        "  MINILLM_FACTS_SOURCE  training-history source file (default: first ~/.codex/memories/*.md, else ~/.codex/memories/memory.md)\n\n" ++
         "Modes:\n" ++
         "  normal     Plain answer generation\n" ++
         "  careful    Abstention-first prompting\n" ++
@@ -1015,7 +1175,7 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
     try printlnColor(&out.interface, colors, Nord.accent, current_model);
     try paint(&out.interface, colors, Nord.muted, "mode: ");
     try printlnColor(&out.interface, colors, Nord.accent, @tagName(mode));
-    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models/models to list models, :modes/modes to list modes, :mode/mode normal|careful|verify|selfcheck, :model/model [name] to show or switch model, or just normal/careful/verify/selfcheck.");
+    try printlnColor(&out.interface, colors, Nord.muted, "Type :q to quit, :models/models to list models, :modes/modes to list modes, :mode/mode normal|careful|verify|selfcheck, :model/model [name] to show or switch model, or just normal/careful/verify/selfcheck. Press Esc Esc while thinking to cancel the current request.");
 
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
@@ -1085,9 +1245,9 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
         }
 
         const status_line = if (try isModelProvenanceQuestion(allocator, line))
-            "checking model metadata..."
+            "checking model metadata... (Esc Esc to cancel)"
         else
-            "thinking...";
+            "thinking... (Esc Esc to cancel)";
         try printlnColor(&out.interface, colors, Nord.muted, status_line);
         const context: PromptContext = .{
             .model = current_model,
@@ -1096,12 +1256,20 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
             .model_facts = unloaded_model_facts,
             .history = history.items,
         };
+        interactive_cancel_enabled = true;
         const output = generateAnswer(allocator, config, line, current_model, mode, context) catch |e| {
+            interactive_cancel_enabled = false;
+            if (e == error.Cancelled) {
+                try printlnColor(&err.interface, colors, Nord.muted, "request cancelled");
+                try out.interface.writeByte('\n');
+                continue;
+            }
             const msg = try std.fmt.allocPrint(allocator, "request failed: {s}", .{@errorName(e)});
             defer allocator.free(msg);
             try printlnColor(&err.interface, colors, Nord.muted, msg);
             continue;
         };
+        interactive_cancel_enabled = false;
         defer allocator.free(output);
 
         try paint(&out.interface, colors, Nord.accent, "model: ");

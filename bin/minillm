@@ -1,8 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
-repo_dir=/Users/jj/Developer/minillm
+repo_dir="$(cd -- "$(dirname -- "$0")/.." && pwd)"
 bin="$repo_dir/zig-out/bin/minillm"
-export MINILLM_REMOTE_HOST="${MINILLM_REMOTE_HOST:-juanlope@Juans-Mac-mini.local}"
+export MINILLM_REMOTE_HOST="${MINILLM_REMOTE_HOST:-user@example-host}"
 if [[ ! -x "$bin" || "$repo_dir/src/main.zig" -nt "$bin" || "$repo_dir/build.zig" -nt "$bin" || "$repo_dir/build.zig.zon" -nt "$bin" ]]; then
   (cd "$repo_dir" && zig build -Doptimize=ReleaseSafe >/dev/null)
 fi

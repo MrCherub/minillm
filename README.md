@@ -78,6 +78,8 @@ In chat mode you can inspect or switch the session model without restarting:
 - `:model jj-code` switches to `jj-code`
 - `:model jj-general` switches back
 
+While a chat request is running, press `Esc` twice to cancel the current request.
+
 ## Defaults
 
 - model: `jj-general`
@@ -91,7 +93,7 @@ export MINILLM_MODEL=jj-code
 export MINILLM_REMOTE_HOST=user@example-host
 export MINILLM_REMOTE_OLLAMA=/Applications/Ollama.app/Contents/Resources/ollama
 export MINILLM_MODEL_FACTS_DIR=$HOME/.config/minillm/model-facts
-export MINILLM_FACTS_SOURCE=$HOME/.codex/memories/jj.md
+export MINILLM_FACTS_SOURCE=$HOME/.codex/memories/memory.md
 ```
 
 ## Notes
@@ -102,5 +104,5 @@ export MINILLM_FACTS_SOURCE=$HOME/.codex/memories/jj.md
 - The SSH fallback path shell-quotes prompts correctly, so apostrophes in questions work.
 - For local machine-state questions, the best long-term fix is still explicit commands or grounded local context, not prompt-only control.
 - For model provenance or training-corpus questions, `minillm` can load trusted per-model notes from `MINILLM_MODEL_FACTS_DIR/<model>.md`.
-- `minillm refresh-facts` writes those notes automatically, using Ollama lineage plus the recorded local training history from `MINILLM_FACTS_SOURCE` or `~/.codex/memories/jj.md`.
+- `minillm refresh-facts` writes those notes automatically, using Ollama lineage plus the recorded local training history from `MINILLM_FACTS_SOURCE` or the first `~/.codex/memories/*.md` file it finds.
 - If no generated notes are available, `minillm` falls back to a small built-in facts block for `jj-general` and `jj-code`.
