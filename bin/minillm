@@ -12,6 +12,11 @@ while [[ -L "$script_path" ]]; do
 done
 repo_dir="$(cd -- "$(dirname -- "$script_path")/.." && pwd)"
 bin="$repo_dir/zig-out/bin/minillm"
+local_env_file="${MINILLM_ENV_FILE:-$HOME/.config/minillm/env}"
+if [[ -f "$local_env_file" ]]; then
+  # shellcheck disable=SC1090
+  source "$local_env_file"
+fi
 export MINILLM_REMOTE_HOST="${MINILLM_REMOTE_HOST:-user@example-host}"
 if [[ ! -x "$bin" || "$repo_dir/src/main.zig" -nt "$bin" || "$repo_dir/build.zig" -nt "$bin" || "$repo_dir/build.zig.zon" -nt "$bin" ]]; then
   (cd "$repo_dir" && zig build -Doptimize=ReleaseSafe >/dev/null)
