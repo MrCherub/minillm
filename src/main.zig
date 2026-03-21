@@ -186,14 +186,16 @@ fn builtinModelFacts(model: []const u8) ?[]const u8 {
         return
             "- `jj-general` is a custom Ollama workflow alias built from `llama3.2:3b`.\n" ++
             "- No trusted local fine-tuning corpus is currently recorded for `jj-general` itself.\n" ++
-            "- Separate local training work exists for proof/predicate corpora, but those runs were LoRA experiments on `Qwen/Qwen2.5-0.5B-Instruct`, not `jj-general`.\n" ++
+            "- Separate local training work exists for proof/predicate/math/formal corpora, but those runs were LoRA experiments on `Qwen/Qwen2.5-0.5B-Instruct`, not `jj-general`.\n" ++
             "- Recorded local corpora from that separate training work include:\n" ++
             "  - `train-proof-v1` exported from `notes-proof-v1.sqlite3`\n" ++
             "  - `FOLIO` v0.0 exported into `train-folio-v1`\n" ++
             "  - `NaturalProofs` ProofWiki exported into `train-naturalproofs-proofwiki-v1`\n" ++
             "  - `train-diffcalc-v1` from the DeepMind mathematics differentiation corpus line\n" ++
             "  - `train-naturalproofs-proofwiki-grounded-v1` for retrieval-grounded NaturalProofs experiments\n" ++
-            "  - `train-set-theory-v1` from the formal set-theory corpus line (`set.mm`, Isabelle/ZF, AFP entries)\n" ++
+            "  - `train-set-theory-v1` from the original formal set-theory corpus line (`set.mm`, Isabelle/ZF, AFP entries)\n" ++
+            "  - `train-set-theory-v2` from the extended set-theory corpus line (`set.mm`, Mizar MML, Isabelle/ZF, selected AFP entries)\n" ++
+            "  - `train-isabelle-source-v1` from Isabelle/AFP source corpora\n" ++
             "- Do not claim those corpora trained `jj-general` unless newer trusted local metadata says so.";
     }
     if (std.mem.eql(u8, model, "jj-code")) {
@@ -314,7 +316,9 @@ const corpus_descriptions = std.StaticStringMap([]const u8).initComptime(.{
     .{ "train-naturalproofs-proofwiki-v1", "exported from `NaturalProofs` ProofWiki" },
     .{ "train-diffcalc-v1", "from the DeepMind mathematics differentiation corpus line" },
     .{ "train-naturalproofs-proofwiki-grounded-v1", "for retrieval-grounded NaturalProofs experiments" },
-    .{ "train-set-theory-v1", "from the formal set-theory corpus line (`set.mm`, Isabelle/ZF, AFP entries)" },
+    .{ "train-set-theory-v1", "from the original formal set-theory corpus line (`set.mm`, Isabelle/ZF, AFP entries)" },
+    .{ "train-set-theory-v2", "from the extended set-theory corpus line (`set.mm`, Mizar MML, Isabelle/ZF, selected AFP entries)" },
+    .{ "train-isabelle-source-v1", "from Isabelle/AFP source corpora" },
 });
 
 fn corpusDescription(dataset_id: []const u8) []const u8 {
