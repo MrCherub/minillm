@@ -454,6 +454,26 @@ fn containsAny(text: []const u8, needles: []const []const u8) bool {
     return false;
 }
 
+fn isDateTimeQuestion(allocator: Allocator, prompt: []const u8) !bool {
+    const lower = try asciiLowerDup(allocator, prompt);
+    defer allocator.free(lower);
+
+    const direct_datetime_phrases = [_][]const u8{
+        "what time",
+        "current time",
+        "date and time",
+        "current date",
+        "today's date",
+        "todays date",
+        "what date",
+        "what day is it",
+        "what day it is",
+    };
+    if (containsAny(lower, &direct_datetime_phrases)) return true;
+
+    return false;
+}
+
 fn isModelProvenanceQuestion(allocator: Allocator, prompt: []const u8) !bool {
     const lower = try asciiLowerDup(allocator, prompt);
     defer allocator.free(lower);
@@ -509,6 +529,20 @@ test "model provenance detection avoids set theory false positives" {
     try std.testing.expect(!(try isModelProvenanceQuestion(allocator, "give me a proof for set theory")));
     try std.testing.expect(!(try isModelProvenanceQuestion(allocator, "explain set theory")));
     try std.testing.expect(!(try isModelProvenanceQuestion(allocator, "write a proof about corpora in set theory notation")));
+}
+
+test "date time detection catches explicit clock questions" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(try isDateTimeQuestion(allocator, "what time is it"));
+    try std.testing.expect(try isDateTimeQuestion(allocator, "what time i sit"));
+    try std.testing.expect(try isDateTimeQuestion(allocator, "what is today's date"));
+    try std.testing.expect(try isDateTimeQuestion(allocator, "give me the current date and time"));
+}
+
+test "date time detection avoids unrelated questions" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(!(try isDateTimeQuestion(allocator, "give me a proof for set theory")));
+    try std.testing.expect(!(try isDateTimeQuestion(allocator, "explain time dilation")));
 }
 
 fn formatModelProvenanceAnswer(allocator: Allocator, context: PromptContext, mode: Mode) ![]u8 {
@@ -888,6 +922,27 @@ fn loadCurrentDateTimeContext(allocator: Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "unix={d}", .{timestamp});
 }
 
+fn answerFromLocalDateTime(allocator: Allocator, mode: Mode) ![]u8 {
+    const current_datetime = try loadCurrentDateTimeContext(allocator);
+    defer allocator.free(current_datetime);
+
+    const summary = try std.fmt.allocPrint(
+        allocator,
+        "The current local date and time is {s}.",
+        .{current_datetime},
+    );
+    defer allocator.free(summary);
+
+    return switch (mode) {
+        .normal => allocator.dupe(u8, summary),
+        .careful, .verify, .selfcheck => std.fmt.allocPrint(
+            allocator,
+            "Answer: {s}\nEvidence basis: Local system clock\nConfidence: high",
+            .{summary},
+        ),
+    };
+}
+
 fn formatPromptContextSection(allocator: Allocator, context: PromptContext) ![]u8 {
     var buffer: std.ArrayList(u8) = .empty;
     errdefer buffer.deinit(allocator);
@@ -1146,6 +1201,9 @@ fn refreshFacts(allocator: Allocator, config: Config, selected_model: ?[]const u
 }
 
 fn generateAnswer(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8, mode: Mode, context: PromptContext) ![]u8 {
+    if (try isDateTimeQuestion(allocator, prompt)) {
+        return answerFromLocalDateTime(allocator, mode);
+    }
     if (try isModelProvenanceQuestion(allocator, prompt)) {
         const resolved = try resolvePromptContextMetadata(allocator, config, context);
         defer freeResolvedPromptContextMetadata(allocator, context, resolved);
@@ -1325,7 +1383,9 @@ fn runChat(allocator: Allocator, config: Config, selected_model: []const u8, ini
             continue;
         }
 
-        const status_line = if (try isModelProvenanceQuestion(allocator, line))
+        const status_line = if (try isDateTimeQuestion(allocator, line))
+            "checking local date/time... (Esc Esc to cancel)"
+        else if (try isModelProvenanceQuestion(allocator, line))
             "checking model metadata... (Esc Esc to cancel)"
         else
             "thinking... (Esc Esc to cancel)";
