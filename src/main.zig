@@ -474,6 +474,20 @@ fn isDateTimeQuestion(allocator: Allocator, prompt: []const u8) !bool {
     return false;
 }
 
+fn isProofStyleRequest(allocator: Allocator, prompt: []const u8) !bool {
+    const lower = try asciiLowerDup(allocator, prompt);
+    defer allocator.free(lower);
+
+    const proof_terms = [_][]const u8{
+        "proof",
+        "prove",
+        "theorem",
+        "lemma",
+        "corollary",
+    };
+    return containsAny(lower, &proof_terms);
+}
+
 fn isModelProvenanceQuestion(allocator: Allocator, prompt: []const u8) !bool {
     const lower = try asciiLowerDup(allocator, prompt);
     defer allocator.free(lower);
@@ -543,6 +557,19 @@ test "date time detection avoids unrelated questions" {
     const allocator = std.testing.allocator;
     try std.testing.expect(!(try isDateTimeQuestion(allocator, "give me a proof for set theory")));
     try std.testing.expect(!(try isDateTimeQuestion(allocator, "explain time dilation")));
+}
+
+test "proof request detection catches proof-style prompts" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(try isProofStyleRequest(allocator, "show me a proof"));
+    try std.testing.expect(try isProofStyleRequest(allocator, "prove the square root of 2 is irrational"));
+    try std.testing.expect(try isProofStyleRequest(allocator, "state a theorem and give a proof"));
+}
+
+test "proof request detection avoids non-proof prompts" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(!(try isProofStyleRequest(allocator, "what time is it")));
+    try std.testing.expect(!(try isProofStyleRequest(allocator, "explain set theory")));
 }
 
 fn formatModelProvenanceAnswer(allocator: Allocator, context: PromptContext, mode: Mode) ![]u8 {
@@ -998,13 +1025,19 @@ fn buildPrompt(allocator: Allocator, system_prompt: []const u8, prompt: []const 
     errdefer buffer.deinit(allocator);
     var writer = buffer.writer(allocator);
     try writer.print("{s}\n\n", .{system_prompt});
+    try writer.writeAll("Use the local context only when it is directly relevant to the user's request. Do not talk about the active model, remote host, current date/time, or provenance unless the user explicitly asked about them or the answer depends on them.\n\n");
     try writer.writeAll(prompt_context);
     try writer.print("\nRecent conversation:\n{s}\nCurrent user message:\n{s}", .{ history_block, prompt });
     return buffer.toOwnedSlice(allocator);
 }
 
 fn askNormal(allocator: Allocator, config: Config, prompt: []const u8, model: []const u8, context: PromptContext) ![]u8 {
-    const full_prompt = try buildPrompt(allocator, "Answer the user's latest message directly and concisely.", prompt, context);
+    const system_prompt =
+        if (try isProofStyleRequest(allocator, prompt))
+            "Answer the user's latest message directly and concisely. Do not narrate which model you will use, and do not explain your routing or prompt context. If the user asks for a proof, provide an actual proof or proof sketch instead of refusing by default. If the request is broad, choose a simple standard theorem and prove it clearly."
+        else
+            "Answer the user's latest message directly and concisely. Do not narrate which model you will use, and do not explain your routing or prompt context.";
+    const full_prompt = try buildPrompt(allocator, system_prompt, prompt, context);
     defer allocator.free(full_prompt);
     return runPrompt(allocator, config, model, full_prompt);
 }
