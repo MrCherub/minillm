@@ -196,6 +196,9 @@ fn builtinModelFacts(model: []const u8) ?[]const u8 {
             "  - `train-set-theory-v1` from the original formal set-theory corpus line (`set.mm`, Isabelle/ZF, AFP entries)\n" ++
             "  - `train-set-theory-v2` from the extended set-theory corpus line (`set.mm`, Mizar MML, Isabelle/ZF, selected AFP entries)\n" ++
             "  - `train-isabelle-source-v1` from Isabelle/AFP source corpora\n" ++
+            "- Related local non-training corpus lines include:\n" ++
+            "  - `tptp-set-v1` as a fetched TPTP SET-domain corpus line\n" ++
+            "  - `formal-eval-v1` as a held-out formal evaluation bundle (`miniF2F`, `PutnamBench`, `Portal-to-ISAbelle`)\n" ++
             "- Do not claim those corpora trained `jj-general` unless newer trusted local metadata says so.";
     }
     if (std.mem.eql(u8, model, "jj-code")) {
@@ -392,7 +395,7 @@ fn buildGeneratedModelFacts(allocator: Allocator, config: Config, model: []const
 
         try writer.writeAll("- `jj-general` is a custom Ollama workflow alias built from `llama3.2:3b`.\n");
         try writer.writeAll("- No trusted local fine-tuning corpus is currently recorded for `jj-general` itself.\n");
-        try writer.writeAll("- Separate local training work exists for proof/predicate/math corpora, but those runs were LoRA experiments on `Qwen/Qwen2.5-0.5B-Instruct`, not `jj-general`.\n");
+        try writer.writeAll("- Separate local training work exists for proof/predicate/math/formal corpora, but those runs were LoRA experiments on `Qwen/Qwen2.5-0.5B-Instruct`, not `jj-general`.\n");
         if (corpora.items.len == 0) {
             try writer.writeAll("- No recorded local training corpora were found in the configured facts source.\n");
         } else {
@@ -401,6 +404,9 @@ fn buildGeneratedModelFacts(allocator: Allocator, config: Config, model: []const
                 try writer.print("  - `{s}` {s}\n", .{ dataset_id, corpusDescription(dataset_id) });
             }
         }
+        try writer.writeAll("- Related local non-training corpus lines include:\n");
+        try writer.writeAll("  - `tptp-set-v1` as a fetched TPTP SET-domain corpus line\n");
+        try writer.writeAll("  - `formal-eval-v1` as a held-out formal evaluation bundle (`miniF2F`, `PutnamBench`, `Portal-to-ISAbelle`)\n");
         try writer.writeAll("- Do not claim those corpora trained `jj-general` unless newer trusted local metadata says so.");
         return output.toOwnedSlice(allocator);
     }
