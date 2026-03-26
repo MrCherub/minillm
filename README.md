@@ -98,11 +98,28 @@ export MINILLM_MODEL_FACTS_DIR=$HOME/.config/minillm/model-facts
 export MINILLM_FACTS_SOURCE=$HOME/.codex/memories/memory.md
 ```
 
+Or keep local machine-specific settings in:
+
+```sh
+~/.config/minillm/env
+```
+
+Example:
+
+```sh
+export MINILLM_REMOTE_HOST=my-mac-mini
+export MINILLM_REMOTE_OLLAMA=/Applications/Ollama.app/Contents/Resources/ollama
+export MINILLM_MODEL=jj-general
+```
+
+Set `MINILLM_ENV_FILE` if you want `minillm` to load a different env file path.
+
 ## Notes
 
 - `minillm` is written in Zig.
 - The default remote model is `jj-general`.
 - Set `MINILLM_REMOTE_HOST` locally to your actual Mac mini host.
+- Exact date/time questions are answered from the local system clock instead of relying only on model text generation.
 - The SSH fallback path shell-quotes prompts correctly, so apostrophes in questions work.
 - For local machine-state questions, the best long-term fix is still explicit commands or grounded local context, not prompt-only control.
 - For model provenance or training-corpus questions, `minillm` can load trusted per-model notes from `MINILLM_MODEL_FACTS_DIR/<model>.md`.
